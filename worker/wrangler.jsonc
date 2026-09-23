@@ -19,9 +19,29 @@
       "id": "ceea977f4d614049a14f4bbcaf05269c"
     }
   ],
+  "d1_databases": [
+    {
+      "binding": "DB",
+      "database_name": "facetimefy",
+      "database_id": "a6b8ed18-b53f-4494-8e5a-443798cf6eb5"
+    }
+  ],
+  "r2_buckets": [
+    {
+      "binding": "CONVERSATIONS_BUCKET",
+      "bucket_name": "shop-chat-conversations"
+    }
+  ],
+  "analytics_engine_datasets": [
+    {
+      "binding": "ANALYTICS_ENGINE_CHAT",
+      "dataset": "shop_chat_analytics"
+    }
+  ],
   "send_email": [
     {
-      "name": "EMAIL"
+      "name": "EMAIL",
+      "remote": true
     }
   ]
 }

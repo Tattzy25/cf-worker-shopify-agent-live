@@ -119,6 +119,9 @@
         chatWindow.classList.toggle('active');
 
         if (chatWindow.classList.contains('active')) {
+          // Track AgentActive telemetry
+          ShopAIChat.Analytics.track('AgentActive');
+
           // On mobile, prevent body scrolling and delay focus
           if (this.isMobile) {
             document.body.classList.add('shop-ai-chat-open');
@@ -238,6 +241,9 @@
 
         // Add user message to chat
         this.add(userMessage, 'user', messagesContainer);
+
+        // Track in-chat message
+        ShopAIChat.Analytics.track('LiveMessagesSent');
 
         // Clear input
         chatInput.value = '';
@@ -537,7 +543,7 @@
           messagesContainer.appendChild(loadingMessage);
 
           // Fetch history from the server
-          const historyUrl = `https://localhost:3458/chat?history=true&conversation_id=${encodeURIComponent(conversationId)}`;
+          const historyUrl = `${this.getApiUrl('/chat')}?conversation_id=${encodeURIComponent(conversationId)}`;
           console.log('Fetching history from:', historyUrl);
 
           const response = await fetch(historyUrl, {
@@ -727,6 +733,37 @@
     },
 
     /**
+     * Facetimefy Attribution Management for Native Shopify Order Tagging
+     */
+    Attribution: {
+      tagUrl: function(url) {
+        if (!url) return url;
+        try {
+          const parsed = new URL(url, window.location.origin);
+          parsed.searchParams.set('utm_source', 'facetimefy');
+          parsed.searchParams.set('utm_medium', 'concierge');
+          parsed.searchParams.set('utm_campaign', 'chat_assistant');
+          return parsed.toString();
+        } catch (_) {
+          const sep = url.includes('?') ? '&' : '?';
+          return `${url}${sep}utm_source=facetimefy&utm_medium=concierge&utm_campaign=chat_assistant`;
+        }
+      },
+      stampSession: function() {
+        try {
+          if (typeof window !== 'undefined' && window.history && window.history.replaceState) {
+            const url = new URL(window.location.href);
+            if (!url.searchParams.has('utm_source')) {
+              url.searchParams.set('utm_source', 'facetimefy');
+              url.searchParams.set('utm_medium', 'concierge');
+              window.history.replaceState(null, '', url.toString());
+            }
+          }
+        } catch (_) {}
+      }
+    },
+
+    /**
      * Product-related functionality
      */
     Product: {
@@ -747,10 +784,16 @@
         const image = document.createElement('img');
         image.src = product.image_url || 'https://cdn.shopify.com/s/files/1/0533/2089/files/placeholder-images-image_large.png';
         image.alt = product.title;
+        image.style.cursor = 'pointer';
         image.onerror = function() {
           // If image fails to load, use a fallback placeholder
           this.src = 'https://cdn.shopify.com/s/files/1/0533/2089/files/placeholder-images-image_large.png';
         };
+        image.addEventListener('click', function() {
+          if (product.url) {
+            window.open(ShopAIChat.Attribution.tagUrl(product.url), '_blank');
+          }
+        });
         imageContainer.appendChild(image);
         card.appendChild(imageContainer);
 
@@ -763,10 +806,10 @@
         title.classList.add('shop-ai-product-title');
         title.textContent = product.title;
 
-        // If product has a URL, make the title a link
+        // If product has a URL, make the title a link with Facetimefy UTM attribution
         if (product.url) {
           const titleLink = document.createElement('a');
-          titleLink.href = product.url;
+          titleLink.href = ShopAIChat.Attribution.tagUrl(product.url);
           titleLink.target = '_blank';
           titleLink.textContent = product.title;
           title.textContent = '';
@@ -791,27 +834,78 @@
           button.dataset.variantId = variantId;
         }
 
-        // Direct native Shopify /cart/add.js
+        // Direct native Shopify /cart/add.js with Facetimefy order attribution
         button.addEventListener('click', async function() {
           const targetVariantId = button.dataset.variantId;
+          const numPrice = parseFloat(String(product.price || '0').replace(/[^0-9.]/g, '')) || 0;
+          const conversationId = sessionStorage.getItem('shopAiConversationId') || '';
+
           if (targetVariantId) {
             const cleanId = String(targetVariantId).includes('/') ? String(targetVariantId).split('/').pop() : targetVariantId;
             button.textContent = 'Adding…';
             button.disabled = true;
             try {
+              // 1. Stamp browser URL so Shopify analytics registers Facetimefy UTM session
+              ShopAIChat.Attribution.stampSession();
+
+              // 2. Add item with Facetimefy properties
               const res = await fetch('/cart/add.js', {
                 method: 'POST',
                 headers: { 'Content-Type': 'application/json', 'Accept': 'application/json' },
-                body: JSON.stringify({ items: [{ id: cleanId, quantity: 1 }] })
+                body: JSON.stringify({
+                  items: [{
+                    id: cleanId,
+                    quantity: 1,
+                    properties: {
+                      '_source': 'facetimefy',
+                      '_assisted_by': 'Facetimefy Concierge'
+                    }
+                  }]
+                })
               });
+
               if (res.ok) {
+                // 3. Update cart attributes for order-level attribution in Shopify Admin
+                try {
+                  await fetch('/cart/update.js', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json', 'Accept': 'application/json' },
+                    body: JSON.stringify({
+                      attributes: {
+                        '_source': 'facetimefy',
+                        '_conversation_id': conversationId,
+                        'utm_source': 'facetimefy',
+                        'utm_medium': 'concierge'
+                      }
+                    })
+                  });
+                } catch (_) {}
+
                 button.textContent = '✓ Added';
                 window.dispatchEvent(new CustomEvent('cart:updated'));
+                ShopAIChat.Analytics.track('AgentAddToCartClick', {
+                  item: product.title || product.id || '',
+                  price: numPrice,
+                  quantity: 1,
+                  status: 'added_to_cart'
+                });
               } else {
                 button.textContent = 'Add to Cart';
+                ShopAIChat.Analytics.track('AgentAddToCartClick', {
+                  item: product.title || product.id || '',
+                  price: numPrice,
+                  quantity: 1,
+                  status: `http_${res.status}`
+                });
               }
             } catch (e) {
               button.textContent = 'Add to Cart';
+              ShopAIChat.Analytics.track('AgentAddToCartClick', {
+                item: product.title || product.id || '',
+                price: numPrice,
+                quantity: 1,
+                status: e.name || 'network_error'
+              });
             } finally {
               button.disabled = false;
             }
@@ -826,6 +920,36 @@
     },
 
     /**
+     * Storefront Telemetry for Cloudflare Analytics Engine
+     */
+    Analytics: {
+      track: function(eventType, metadata = {}) {
+        try {
+          const shopDomain = window.shopPermanentDomain || window.shopDomain || window.location.hostname;
+          const conversationId = sessionStorage.getItem('shopAiConversationId') || '';
+          const apiUrl = ShopAIChat.API.getApiUrl('/analytics/event');
+
+          const payload = {
+            event_type: eventType,
+            store_domain: shopDomain,
+            page_url: window.location.pathname || '/',
+            conversation_id: conversationId,
+            ...metadata
+          };
+
+          if (typeof fetch === 'function') {
+            fetch(apiUrl, {
+              method: 'POST',
+              headers: { 'Content-Type': 'application/json', 'Accept': 'application/json' },
+              body: JSON.stringify(payload),
+              keepalive: true
+            }).catch(() => {});
+          }
+        } catch (_) {}
+      }
+    },
+
+    /**
      * Initialize the chat application
      */
     init: function() {
@@ -834,6 +958,9 @@
       if (!container) return;
 
       this.UI.init(container);
+
+      // Record bubble shown telemetry
+      this.Analytics.track('AgentBubbleShown');
 
       // Check for existing conversation
       const conversationId = sessionStorage.getItem('shopAiConversationId');

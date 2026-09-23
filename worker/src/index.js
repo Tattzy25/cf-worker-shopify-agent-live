@@ -95,8 +95,7 @@ const OPENAI_TOOLS = [
     quality: "medium",
     output_format: "webp",
     background: "auto",
-    moderation: "low",
-    partial_images: 3
+    moderation: "low"
   },
   {
     type: "mcp",
@@ -159,6 +158,197 @@ export default {
         return await handleAdminSettings(request, env, headers);
       }
 
+      // Route: Merchant Direct Email Dispatch (POST /admin/send-email)
+      if (url.pathname === "/admin/send-email" && request.method === "POST") {
+        const body = await request.json();
+        const to = body.to;
+        if (!to) {
+          return new Response(JSON.stringify({ error: "Missing recipient 'to' email" }), { status: 400, headers });
+        }
+
+        const subject = body.subject || "[Facetimefy AI Concierge] Merchant System Overview & Verification";
+        const text = body.text || "Overview of the Storefront AI Concierge infrastructure.";
+        const html = body.html || `<p>${text}</p>`;
+
+        if (!env.EMAIL || typeof env.EMAIL.send !== "function") {
+          return new Response(JSON.stringify({ error: "Cloudflare EMAIL binding not configured" }), { status: 500, headers });
+        }
+
+        try {
+          const emailRes = await env.EMAIL.send({
+            to,
+            from: "error@urgent.facetimefy.com",
+            subject,
+            html,
+            text
+          });
+          return new Response(JSON.stringify({
+            status: "success",
+            method: "cloudflare_email_service",
+            from: "error@urgent.facetimefy.com",
+            to,
+            messageId: emailRes?.messageId || "dispatched"
+          }), { headers });
+        } catch (emailErr) {
+          console.error("[Email] Failed to send via Cloudflare Email binding:", emailErr);
+          return new Response(JSON.stringify({
+            status: "error",
+            error: emailErr.message || String(emailErr)
+          }), { status: 500, headers });
+        }
+      }
+
+      // Route: Storefront Telemetry Events (POST /analytics/event)
+      if (url.pathname === "/analytics/event" && request.method === "POST") {
+        const body = await request.json().catch(() => ({}));
+        const country = request.headers.get("cf-ipcountry") || "";
+        const storeDomain = resolveStoreDomain(request, body);
+
+        // Fetch merchant settings so we associate the actual merchant AI provider/model dynamically if not in payload
+        const merchantConfig = await getMerchantConfig(storeDomain, env);
+
+        // 1. Write to Analytics Engine
+        recordAnalyticsEvent(env, {
+          eventType: body.event_type || body.eventType || "",
+          storeDomain,
+          country,
+          pageUrl: body.page_url || body.pathname || "",
+          conversationId: body.conversation_id || "",
+          provider: body.provider || merchantConfig.provider || "",
+          itemOrModel: body.item || body.product_id || body.product_title || merchantConfig.model || "",
+          status: body.status || "",
+          latencyMs: Number(body.latency_ms) || 0,
+          priceOrValue: Number(body.price) || 0,
+          quantityOrDepth: Number(body.quantity) || 0
+        });
+
+        // 2. Persist to D1 Relational Tables for Merchant Business Metrics
+        if (env.DB && ctx && ctx.waitUntil) {
+          const eventType = body.event_type || body.eventType || "";
+          
+          // AI Assisted Sales
+          if (eventType === "AgentAddToCartClick" || eventType === "AgentProductClick") {
+            ctx.waitUntil(
+              env.DB.prepare(`
+                INSERT INTO ai_assisted_sales (shop, conversation_id, product_id, product_title, price, event_type)
+                VALUES (?, ?, ?, ?, ?, ?)
+              `).bind(
+                storeDomain,
+                body.conversation_id || "",
+                body.product_id || "",
+                body.item || body.product_title || "",
+                Number(body.price) || 0,
+                eventType === "AgentAddToCartClick" ? "added_to_cart" : "clicked"
+              ).run().catch(e => console.error("[D1] Error logging assisted sale:", e))
+            );
+          }
+
+          // Customer Demand & Support Insights
+          if (eventType === "AgentZeroResults" || eventType === "AgentFaqResolved") {
+            ctx.waitUntil(
+              env.DB.prepare(`
+                INSERT INTO customer_demand_insights (shop, conversation_id, customer_query, category, matched_items_count, outcome)
+                VALUES (?, ?, ?, ?, ?, ?)
+              `).bind(
+                storeDomain,
+                body.conversation_id || "",
+                body.query || body.item || "",
+                body.category || "",
+                Number(body.matched_count) || 0,
+                body.status || ""
+              ).run().catch(e => console.error("[D1] Error logging demand insight:", e))
+            );
+          }
+        }
+
+        return new Response(JSON.stringify({ status: "recorded" }), { headers });
+      }
+
+      // Route: Admin Analytics Overview (GET /admin/analytics?shop=...)
+      if (url.pathname === "/admin/analytics" && request.method === "GET") {
+        const shop = url.searchParams.get("shop") || "all";
+        let stats = {
+          shop,
+          summary: {
+            assisted_revenue: 0,
+            cart_adds: 0,
+            support_inquiries_resolved: 0,
+            support_hours_saved: 0,
+            total_conversations: 0,
+            total_messages: 0,
+            total_errors: 0
+          },
+          top_sold_products: [],
+          missed_opportunities: [],
+          support_inquiries: [],
+          recent_conversations: [],
+          recent_errors: []
+        };
+
+        if (env.DB) {
+          try {
+            // Conversions & Assisted Sales
+            const salesSummary = shop !== "all"
+              ? await env.DB.prepare(`SELECT COALESCE(SUM(price), 0) as rev, COUNT(*) as adds FROM ai_assisted_sales WHERE shop = ? AND event_type = 'added_to_cart'`).bind(shop).first()
+              : await env.DB.prepare(`SELECT COALESCE(SUM(price), 0) as rev, COUNT(*) as adds FROM ai_assisted_sales WHERE event_type = 'added_to_cart'`).first();
+
+            stats.summary.assisted_revenue = salesSummary?.rev || 0;
+            stats.summary.cart_adds = salesSummary?.adds || 0;
+
+            // Top AI-Sold Products
+            const topProducts = shop !== "all"
+              ? await env.DB.prepare(`SELECT product_title, COUNT(*) as cart_adds, COALESCE(SUM(price), 0) as total_revenue FROM ai_assisted_sales WHERE shop = ? AND event_type = 'added_to_cart' GROUP BY product_title ORDER BY cart_adds DESC LIMIT 5`).bind(shop).all()
+              : await env.DB.prepare(`SELECT product_title, COUNT(*) as cart_adds, COALESCE(SUM(price), 0) as total_revenue FROM ai_assisted_sales WHERE event_type = 'added_to_cart' GROUP BY product_title ORDER BY cart_adds DESC LIMIT 5`).all();
+
+            stats.top_sold_products = topProducts?.results || [];
+
+            // Missed Opportunities (Unmet Demand: matched_items_count = 0)
+            const missedOps = shop !== "all"
+              ? await env.DB.prepare(`SELECT customer_query, COUNT(*) as request_count, MAX(created_at) as last_requested FROM customer_demand_insights WHERE shop = ? AND matched_items_count = 0 GROUP BY customer_query ORDER BY request_count DESC LIMIT 5`).bind(shop).all()
+              : await env.DB.prepare(`SELECT customer_query, COUNT(*) as request_count, MAX(created_at) as last_requested FROM customer_demand_insights WHERE matched_items_count = 0 GROUP BY customer_query ORDER BY request_count DESC LIMIT 5`).all();
+
+            stats.missed_opportunities = missedOps?.results || [];
+
+            // Customer Support Inquiries
+            const supportStats = shop !== "all"
+              ? await env.DB.prepare(`SELECT category, COUNT(*) as count FROM customer_demand_insights WHERE shop = ? AND outcome = 'policy_answered' GROUP BY category ORDER BY count DESC`).bind(shop).all()
+              : await env.DB.prepare(`SELECT category, COUNT(*) as count FROM customer_demand_insights WHERE outcome = 'policy_answered' GROUP BY category ORDER BY count DESC`).all();
+
+            stats.support_inquiries = supportStats?.results || [];
+            const totalSupportInquiries = stats.support_inquiries.reduce((acc, curr) => acc + (curr.count || 0), 0);
+            stats.summary.support_inquiries_resolved = totalSupportInquiries;
+            stats.summary.support_hours_saved = Number((totalSupportInquiries * 0.083).toFixed(1)); // ~5 mins saved per inquiry
+
+            // Conversations & Errors
+            const convStats = shop !== "all" 
+              ? await env.DB.prepare(`SELECT COUNT(*) as conv_count, COALESCE(SUM(message_count), 0) as msg_count FROM conversations WHERE shop = ?`).bind(shop).first()
+              : await env.DB.prepare(`SELECT COUNT(*) as conv_count, COALESCE(SUM(message_count), 0) as msg_count FROM conversations`).first();
+            
+            const errStats = shop !== "all"
+              ? await env.DB.prepare(`SELECT COUNT(*) as err_count FROM error_logs WHERE shop = ?`).bind(shop).first()
+              : await env.DB.prepare(`SELECT COUNT(*) as err_count FROM error_logs`).first();
+
+            const recentConvs = shop !== "all"
+              ? await env.DB.prepare(`SELECT id, message_count, updated_at FROM conversations WHERE shop = ? ORDER BY updated_at DESC LIMIT 5`).bind(shop).all()
+              : await env.DB.prepare(`SELECT id, shop, message_count, updated_at FROM conversations ORDER BY updated_at DESC LIMIT 5`).all();
+
+            const recentErrs = shop !== "all"
+              ? await env.DB.prepare(`SELECT id, user_message, error, created_at FROM error_logs WHERE shop = ? ORDER BY id DESC LIMIT 5`).bind(shop).all()
+              : await env.DB.prepare(`SELECT id, shop, user_message, error, created_at FROM error_logs ORDER BY id DESC LIMIT 5`).all();
+
+            stats.summary.total_conversations = convStats?.conv_count || 0;
+            stats.summary.total_messages = convStats?.msg_count || 0;
+            stats.summary.total_errors = errStats?.err_count || 0;
+            stats.recent_conversations = recentConvs?.results || [];
+            stats.recent_errors = recentErrs?.results || [];
+          } catch (dbErr) {
+            console.error("[Admin Analytics] D1 query failed:", dbErr);
+          }
+        }
+
+        return new Response(JSON.stringify(stats, null, 2), { headers });
+      }
+
       return new Response(JSON.stringify({ error: "Not Found" }), { status: 404, headers });
 
     } catch (err) {
@@ -171,6 +361,7 @@ export default {
  * Handle incoming shopper chat request
  */
 async function handleChatRequest(request, env, ctx, headers) {
+  const startTime = Date.now();
   const body = await request.json();
   const userMessage = body.message;
   const conversationId = body.conversation_id || `conv_${Date.now()}`;
@@ -180,14 +371,7 @@ async function handleChatRequest(request, env, ctx, headers) {
   }
 
   // Resolve Store Domain
-  let rawOrigin = body.store_domain || request.headers.get("X-Shopify-Shop-Domain") || request.headers.get("Origin") || "";
-  let storeDomain = "";
-  try {
-    storeDomain = rawOrigin.startsWith("http") ? new URL(rawOrigin).hostname : rawOrigin;
-  } catch {
-    storeDomain = rawOrigin;
-  }
-  if (!storeDomain) storeDomain = "musarty.com";
+  const storeDomain = resolveStoreDomain(request, body);
 
   // Fetch Merchant Settings (BYOK or Platform)
   const merchantConfig = await getMerchantConfig(storeDomain, env);
@@ -220,26 +404,94 @@ async function handleChatRequest(request, env, ctx, headers) {
       });
     }
   } catch (err) {
-    // Send separate alert to merchant via Resend or Cloudflare Email (never to customer)
+    // Send separate alert to merchant (strictly to their notificationEmail, NO FALLBACKS)
     if (ctx && ctx.waitUntil) {
       ctx.waitUntil(sendMerchantErrorAlert({
         storeDomain,
         conversationId,
         userMessage,
         error: err.message || String(err),
-        recipientEmail: merchantConfig.notificationEmail || env.ADMIN_ALERT_EMAIL,
+        recipientEmail: merchantConfig.notificationEmail,
         env
       }));
     }
+
+    // Analytics Engine: Record error
+    const country = request.headers.get("cf-ipcountry") || "";
+    recordAnalyticsEvent(env, {
+      eventType: "error",
+      storeDomain,
+      country,
+      pageUrl: "/chat",
+      conversationId,
+      provider: merchantConfig.provider || "",
+      itemOrModel: merchantConfig.model || "",
+      status: err.name || "error",
+      latencyMs: Date.now() - startTime,
+      priceOrValue: 0,
+      quantityOrDepth: history.length
+    });
 
     return new Response(JSON.stringify({ error: err.message || String(err) }), { status: 500, headers });
   }
 
   // Save updated history
   history.push({ role: "assistant", content: assistantText });
+
+  // 1. Save in KV for ultra-fast edge access
   if (env.CHAT_HISTORY) {
     await env.CHAT_HISTORY.put(conversationId, JSON.stringify(history.slice(-20)), { expirationTtl: 86400 * 7 });
   }
+
+  // 2. Save full conversation JSON in R2 bucket
+  const r2Key = `conversations/${storeDomain}/${conversationId}.json`;
+  if (env.CONVERSATIONS_BUCKET) {
+    const r2Payload = {
+      shop: storeDomain,
+      conversationId,
+      messageCount: history.length,
+      messages: history,
+      updatedAt: new Date().toISOString()
+    };
+    if (ctx && ctx.waitUntil) {
+      ctx.waitUntil(
+        env.CONVERSATIONS_BUCKET.put(r2Key, JSON.stringify(r2Payload, null, 2), {
+          httpMetadata: { contentType: "application/json" }
+        }).catch(e => console.error("[R2] Error writing conversation:", e))
+      );
+    }
+  }
+
+  // 3. Index conversation in D1 database
+  if (env.DB && ctx && ctx.waitUntil) {
+    ctx.waitUntil(
+      env.DB.prepare(`
+        INSERT INTO conversations (id, shop, message_count, r2_key, updated_at)
+        VALUES (?, ?, ?, ?, CURRENT_TIMESTAMP)
+        ON CONFLICT(id) DO UPDATE SET
+          message_count = excluded.message_count,
+          r2_key = excluded.r2_key,
+          updated_at = CURRENT_TIMESTAMP
+      `).bind(conversationId, storeDomain, history.length, r2Key).run()
+        .catch(e => console.error("[D1] Error updating conversation row:", e))
+    );
+  }
+
+  // 4. Record Analytics Engine data point (AgentTurn)
+  const country = request.headers.get("cf-ipcountry") || "";
+  recordAnalyticsEvent(env, {
+    eventType: "AgentTurn",
+    storeDomain,
+    country,
+    pageUrl: "/chat",
+    conversationId,
+    provider: merchantConfig.provider || "",
+    itemOrModel: merchantConfig.model || "",
+    status: assistantText ? "completed" : "empty_response",
+    latencyMs: Date.now() - startTime,
+    priceOrValue: 0,
+    quantityOrDepth: history.length
+  });
 
   return new Response(JSON.stringify({
     conversation_id: conversationId,
@@ -464,6 +716,26 @@ async function getMerchantConfig(shopDomain, env) {
     config = await env.MERCHANT_SETTINGS.get(shopDomain, { type: "json" });
   }
 
+  // Fallback to D1 database if not cached in KV
+  if (!config && env.DB) {
+    try {
+      const row = await env.DB.prepare("SELECT * FROM merchants WHERE shop = ?").bind(shopDomain).first();
+      if (row) {
+        config = {
+          provider: row.provider,
+          model: row.model,
+          apiKey: row.api_key,
+          notificationEmail: row.notification_email
+        };
+        if (env.MERCHANT_SETTINGS) {
+          await env.MERCHANT_SETTINGS.put(shopDomain, JSON.stringify(config));
+        }
+      }
+    } catch (e) {
+      console.error("[D1] Error fetching merchant from DB:", e);
+    }
+  }
+
   if (config) {
     if (config.provider === "platform") {
       const platformKey = env.OPENAI_API_KEY || env.GEMINI_API_KEY;
@@ -473,11 +745,12 @@ async function getMerchantConfig(shopDomain, env) {
       return {
         provider: env.OPENAI_API_KEY ? "openai" : "gemini",
         apiKey: platformKey,
-        model: config.model || (env.OPENAI_API_KEY ? "gpt-5.5" : "gemini-3.6-flash")
+        model: config.model || (env.OPENAI_API_KEY ? "gpt-5.5" : "gemini-3.6-flash"),
+        notificationEmail: config.notificationEmail
       };
     }
 
-    // Merchant chose their own key (BYOK) - strictly use their key
+    // Merchant chose their own key (BYOK) - strictly use their key (ZERO FALLBACK)
     if (!config.apiKey) {
       throw new Error(`No API key configured for ${shopDomain}. Configure your key in the app admin.`);
     }
@@ -485,7 +758,8 @@ async function getMerchantConfig(shopDomain, env) {
     return {
       provider: config.provider || "openai",
       apiKey: config.apiKey,
-      model: config.model || (config.provider === "gemini" ? "gemini-3.6-flash" : "gpt-5.5")
+      model: config.model || (config.provider === "gemini" ? "gemini-3.6-flash" : "gpt-5.5"),
+      notificationEmail: config.notificationEmail
     };
   }
 
@@ -523,25 +797,46 @@ async function handleAdminSettings(request, env, headers) {
     const safeConfig = config ? {
       provider: config.provider || "openai",
       model: config.model || "gpt-5.5",
-      hasCustomKey: Boolean(config.apiKey)
-    } : { provider: "openai", model: "gpt-5.5", hasCustomKey: false };
+      hasCustomKey: Boolean(config.apiKey),
+      notificationEmail: config.notificationEmail || ""
+    } : { provider: "openai", model: "gpt-5.5", hasCustomKey: false, notificationEmail: "" };
 
     return new Response(JSON.stringify(safeConfig), { headers });
   }
 
   if (request.method === "POST") {
     const payload = await request.json();
-    const { shop, provider, apiKey, model } = payload;
+    const { shop, provider, apiKey, model, notificationEmail } = payload;
     if (!shop) {
       return new Response(JSON.stringify({ error: "Missing shop parameter" }), { status: 400, headers });
     }
 
+    // 1. Persist to D1 Database
+    if (env.DB) {
+      try {
+        await env.DB.prepare(`
+          INSERT INTO merchants (shop, notification_email, provider, model, api_key, updated_at)
+          VALUES (?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
+          ON CONFLICT(shop) DO UPDATE SET
+            notification_email = CASE WHEN excluded.notification_email != '' THEN excluded.notification_email ELSE merchants.notification_email END,
+            provider = excluded.provider,
+            model = excluded.model,
+            api_key = COALESCE(excluded.api_key, merchants.api_key),
+            updated_at = CURRENT_TIMESTAMP
+        `).bind(shop, notificationEmail || "", provider || "openai", model || "gpt-5.5", apiKey || null).run();
+      } catch (e) {
+        console.error("[D1] Error saving merchant to D1:", e);
+      }
+    }
+
+    // 2. Persist to KV for ultra-fast edge lookup
     if (env.MERCHANT_SETTINGS) {
       const existing = (await env.MERCHANT_SETTINGS.get(shop, { type: "json" })) || {};
       const updated = {
         provider: provider || existing.provider || "openai",
         model: model || existing.model || "gpt-5.5",
         apiKey: apiKey !== undefined ? apiKey : existing.apiKey,
+        notificationEmail: notificationEmail !== undefined && notificationEmail !== "" ? notificationEmail : existing.notificationEmail,
         updatedAt: new Date().toISOString()
       };
       await env.MERCHANT_SETTINGS.put(shop, JSON.stringify(updated));
@@ -587,12 +882,24 @@ function getCorsHeaders(request) {
 }
 
 /**
- * Send error alert to merchant/admin via Resend or Cloudflare Email (never to customer)
+ * Send error alert strictly to merchant (NO FALLBACKS)
  */
 async function sendMerchantErrorAlert({ storeDomain, conversationId, userMessage, error, recipientEmail, env }) {
-  const targetEmail = recipientEmail || env.ADMIN_ALERT_EMAIL;
+  // Always record error in D1 error_logs table
+  if (env.DB) {
+    try {
+      await env.DB.prepare(
+        "INSERT INTO error_logs (shop, conversation_id, user_message, error) VALUES (?, ?, ?, ?)"
+      ).bind(storeDomain, conversationId || "unknown", userMessage || "", String(error)).run();
+    } catch (e) {
+      console.error("[D1] Error recording error_log:", e);
+    }
+  }
+
+  // STRICT ZERO FALLBACK: Only send to this specific merchant's verified store email
+  const targetEmail = recipientEmail;
   if (!targetEmail) {
-    console.error("[Alert] No recipient email configured for error alerts.");
+    console.error(`[Alert] No notification email for merchant ${storeDomain}. Error logged to D1 table only.`);
     return;
   }
 
@@ -635,45 +942,95 @@ async function sendMerchantErrorAlert({ storeDomain, conversationId, userMessage
   // 1. Cloudflare Native Email Sending binding
   if (env.EMAIL && typeof env.EMAIL.send === 'function') {
     try {
-      await env.EMAIL.send({
+      const emailRes = await env.EMAIL.send({
         to: targetEmail,
-        from: "welcome@facetimefy.com",
+        from: "error@urgent.facetimefy.com",
         subject,
         html,
         text: `AI Concierge Alert for ${storeDomain}:\n${error}\nShopper Message: ${userMessage}`
       });
-      console.log(`[Alert] Sent Cloudflare Email to ${targetEmail}`);
+      console.log(`[Alert] Sent Cloudflare Email to ${targetEmail} (id: ${emailRes?.messageId || "ok"})`);
       return;
     } catch (e) {
       console.error("[Alert] Failed sending Cloudflare Email:", e);
     }
   }
+}
 
-  // 2. Resend API
-  if (env.RESEND_API_KEY) {
-    try {
-      const res = await fetch("https://api.resend.com/emails", {
-        method: "POST",
-        headers: {
-          "Authorization": `Bearer ${env.RESEND_API_KEY}`,
-          "Content-Type": "application/json"
-        },
-        body: JSON.stringify({
-          from: env.ALERT_FROM_EMAIL || "onboarding@resend.dev",
-          to: targetEmail,
-          subject,
-          html
-        })
-      });
-      if (res.ok) {
-        console.log(`[Alert] Sent Resend email to ${targetEmail}`);
-      } else {
-        const errText = await res.text();
-        console.error("[Alert] Resend API error:", errText);
-      }
-    } catch (e) {
-      console.error("[Alert] Failed sending Resend email:", e);
-    }
+/**
+ * Resolve store domain from headers, body, or origin
+ */
+function resolveStoreDomain(request, body = {}) {
+  let rawOrigin = body.store_domain || request.headers.get("X-Shopify-Shop-Domain") || request.headers.get("Origin") || "";
+  let storeDomain = "";
+  try {
+    storeDomain = rawOrigin.startsWith("http") ? new URL(rawOrigin).hostname : rawOrigin;
+  } catch {
+    storeDomain = rawOrigin;
+  }
+  return storeDomain || "";
+}
+
+/**
+ * Record an event to Cloudflare Analytics Engine (dataset: shop_chat_analytics).
+ * 
+ * Strict Schema Order:
+ * blobs: [
+ *   blob1: event_type       (e.g., 'AgentBubbleShown', 'AgentActive', 'AgentTurn', 'AgentProductClick', 'AgentAddToCartClick', 'AgentCheckout', 'error')
+ *   blob2: store_domain     (e.g., 'facetimefy.myshopify.com')
+ *   blob3: country          (e.g., 'US', 'GB' from request 'cf-ipcountry' header)
+ *   blob4: page_url         (e.g., '/products/cool-shirt')
+ *   blob5: conversation_id  (e.g., 'conv_123456')
+ *   blob6: provider         (e.g., 'openai', 'gemini', 'storefront')
+ *   blob7: item_or_model    (e.g., 'gpt-5.5', 'gemini-3.6-flash', product title/id)
+ *   blob8: status           (e.g., 'success', 'error', 'clicked', 'added')
+ * ]
+ * doubles: [
+ *   double1: 1              (Count: ALWAYS 1 so SUM(_sample_interval * double1) works accurately with sampling)
+ *   double2: latency_ms     (Response time / latency in ms, or 0)
+ *   double3: price_or_value (Monetary price/value in dollars, or 0)
+ *   double4: quantity_or_depth (Product quantity or conversation turn depth)
+ * ]
+ * indexes: [storeDomain]    (Fast index for filtering per store)
+ */
+function recordAnalyticsEvent(env, {
+  eventType = "",
+  storeDomain = "",
+  country = "",
+  pageUrl = "",
+  conversationId = "",
+  provider = "",
+  itemOrModel = "",
+  status = "",
+  latencyMs = 0,
+  priceOrValue = 0,
+  quantityOrDepth = 0
+}) {
+  const analytics = env.ANALYTICS_ENGINE_CHAT || env.ANALYTICS;
+  if (!analytics || typeof analytics.writeDataPoint !== "function") return;
+
+  try {
+    analytics.writeDataPoint({
+      indexes: [String(storeDomain || "")],
+      blobs: [
+        String(eventType || ""),
+        String(storeDomain || ""),
+        String(country || ""),
+        String(pageUrl || ""),
+        String(conversationId || ""),
+        String(provider || ""),
+        String(itemOrModel || ""),
+        String(status || "")
+      ],
+      doubles: [
+        1, // double1: canonical event count for SUM(_sample_interval * double1)
+        Number(latencyMs) || 0,
+        Number(priceOrValue) || 0,
+        Number(quantityOrDepth) || 0
+      ]
+    });
+  } catch (err) {
+    console.error("[Analytics Engine] Error writing data point:", err);
   }
 }
 
