@@ -246,11 +246,10 @@
         ShopAIChat.UI.showTypingIndicator();
 
         try {
-          ShopAIChat.API.streamResponse(userMessage, conversationId, messagesContainer);
+          await ShopAIChat.API.sendMessage(userMessage, conversationId, messagesContainer);
         } catch (error) {
-          console.error('Error communicating with Claude API:', error);
+          console.error(error);
           ShopAIChat.UI.removeTypingIndicator();
-          this.add("Sorry, I couldn't process your request at the moment. Please try again later.", 'assistant', messagesContainer);
         }
       },
 
@@ -464,155 +463,63 @@
      * API communication and data handling
      */
     API: {
+      getApiUrl: function(path) {
+        const configUrl = window.shopChatConfig && window.shopChatConfig.apiUrl;
+        if (configUrl && configUrl.trim()) {
+          const base = configUrl.replace(/\/+$/, '');
+          return base.endsWith('/chat') ? base : `${base}${path}`;
+        }
+        return `https://shop-chat-agent-worker.avi-kay2019.workers.dev${path}`;
+      },
+
       /**
-       * Stream a response from the API
+       * Send a message to the API and process standard JSON response
        * @param {string} userMessage - User's message text
        * @param {string} conversationId - Conversation ID for context
        * @param {HTMLElement} messagesContainer - The messages container
        */
-      streamResponse: async function(userMessage, conversationId, messagesContainer) {
-        let currentMessageElement = null;
+      sendMessage: async function(userMessage, conversationId, messagesContainer) {
+        const apiUrl = this.getApiUrl('/chat');
+        const shopDomain = window.shopPermanentDomain || window.shopDomain || window.location.hostname;
 
-        try {
-          const promptType = window.shopChatConfig?.promptType || "standardAssistant";
-          const requestBody = JSON.stringify({
+        const response = await fetch(apiUrl, {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/json',
+            'Accept': 'application/json',
+            'X-Shopify-Shop-Domain': shopDomain
+          },
+          body: JSON.stringify({
             message: userMessage,
             conversation_id: conversationId,
-            prompt_type: promptType
-          });
+            store_domain: shopDomain
+          })
+        });
 
-          const streamUrl = 'https://localhost:3458/chat';
-          const shopId = window.shopId;
+        ShopAIChat.UI.removeTypingIndicator();
 
-          const response = await fetch(streamUrl, {
-            method: 'POST',
-            headers: {
-              'Content-Type': 'application/json',
-              'Accept': 'text/event-stream',
-              'X-Shopify-Shop-Id': shopId
-            },
-            body: requestBody
-          });
-
-          const reader = response.body.getReader();
-          const decoder = new TextDecoder();
-          let buffer = '';
-
-          // Create initial message element
-          let messageElement = document.createElement('div');
-          messageElement.classList.add('shop-ai-message', 'assistant');
-          messageElement.textContent = '';
-          messageElement.dataset.rawText = '';
-          messagesContainer.appendChild(messageElement);
-          currentMessageElement = messageElement;
-
-          // Process the stream
-          while (true) {
-            const { value, done } = await reader.read();
-            if (done) break;
-
-            buffer += decoder.decode(value, { stream: true });
-            const lines = buffer.split('\n\n');
-            buffer = lines.pop() || '';
-
-            for (const line of lines) {
-              if (line.startsWith('data: ')) {
-                try {
-                  const data = JSON.parse(line.slice(6));
-                  this.handleStreamEvent(data, currentMessageElement, messagesContainer, userMessage,
-                    (newElement) => { currentMessageElement = newElement; });
-                } catch (e) {
-                  console.error('Error parsing event data:', e, line);
-                }
-              }
-            }
-          }
-        } catch (error) {
-          console.error('Error in streaming:', error);
-          ShopAIChat.UI.removeTypingIndicator();
-          ShopAIChat.Message.add("Sorry, I couldn't process your request. Please try again later.",
-            'assistant', messagesContainer);
+        if (!response.ok) {
+          const errText = await response.text();
+          console.error('Chat request failed:', response.status, errText);
+          return;
         }
-      },
 
-      /**
-       * Handle stream events from the API
-       * @param {Object} data - Event data
-       * @param {HTMLElement} currentMessageElement - Current message element being updated
-       * @param {HTMLElement} messagesContainer - The messages container
-       * @param {string} userMessage - The original user message
-       * @param {Function} updateCurrentElement - Callback to update the current element reference
-       */
-      handleStreamEvent: function(data, currentMessageElement, messagesContainer, userMessage, updateCurrentElement) {
-        switch (data.type) {
-          case 'id':
-            if (data.conversation_id) {
-              sessionStorage.setItem('shopAiConversationId', data.conversation_id);
-            }
-            break;
+        const data = await response.json();
+        if (data.error) {
+          console.error('Chat error:', data.error);
+          return;
+        }
 
-          case 'chunk':
-            ShopAIChat.UI.removeTypingIndicator();
-            currentMessageElement.dataset.rawText += data.chunk;
-            currentMessageElement.textContent = currentMessageElement.dataset.rawText;
-            ShopAIChat.UI.scrollToBottom();
-            break;
+        if (data.conversation_id) {
+          sessionStorage.setItem('shopAiConversationId', data.conversation_id);
+        }
 
-          case 'message_complete':
-            ShopAIChat.UI.removeTypingIndicator();
-            ShopAIChat.Formatting.formatMessageContent(currentMessageElement);
-            ShopAIChat.UI.scrollToBottom();
-            break;
+        if (data.message) {
+          ShopAIChat.Message.add(data.message, 'assistant', messagesContainer);
+        }
 
-          case 'end_turn':
-            ShopAIChat.UI.removeTypingIndicator();
-            break;
-
-          case 'error':
-            console.error('Stream error:', data.error);
-            ShopAIChat.UI.removeTypingIndicator();
-            currentMessageElement.textContent = "Sorry, I couldn't process your request. Please try again later.";
-            break;
-
-          case 'rate_limit_exceeded':
-            console.error('Rate limit exceeded:', data.error);
-            ShopAIChat.UI.removeTypingIndicator();
-            currentMessageElement.textContent = "Sorry, our servers are currently busy. Please try again later.";
-            break;
-
-          case 'auth_required':
-            // Save the last user message for resuming after authentication
-            sessionStorage.setItem('shopAiLastMessage', userMessage || '');
-            break;
-
-          case 'product_results':
-            ShopAIChat.UI.displayProductResults(data.products);
-            break;
-
-          case 'tool_use':
-            if (data.tool_use_message) {
-              ShopAIChat.Message.addToolUse(data.tool_use_message, messagesContainer);
-            }
-            break;
-
-          case 'new_message':
-            ShopAIChat.Formatting.formatMessageContent(currentMessageElement);
-            ShopAIChat.UI.showTypingIndicator();
-
-            // Create new message element for the next response
-            const newMessageElement = document.createElement('div');
-            newMessageElement.classList.add('shop-ai-message', 'assistant');
-            newMessageElement.textContent = '';
-            newMessageElement.dataset.rawText = '';
-            messagesContainer.appendChild(newMessageElement);
-
-            // Update the current element reference
-            updateCurrentElement(newMessageElement);
-            break;
-
-          case 'content_block_complete':
-            ShopAIChat.UI.showTypingIndicator();
-            break;
+        if (data.products && Array.isArray(data.products) && data.products.length > 0) {
+          ShopAIChat.UI.displayProductResults(data.products);
         }
       },
 
@@ -878,18 +785,35 @@
         const button = document.createElement('button');
         button.classList.add('shop-ai-add-to-cart');
         button.textContent = 'Add to Cart';
-        button.dataset.productId = product.id;
+        button.dataset.productId = product.id || '';
+        const variantId = product.variant_id || product.selected_variant_id || product.id;
+        if (variantId) {
+          button.dataset.variantId = variantId;
+        }
 
-        // Add click handler for the button
-        button.addEventListener('click', function() {
-          // Send message to add this product to cart
-          const input = document.querySelector('.shop-ai-chat-input input');
-          if (input) {
-            input.value = `Add ${product.title} to my cart`;
-            // Trigger a click on the send button
-            const sendButton = document.querySelector('.shop-ai-chat-send');
-            if (sendButton) {
-              sendButton.click();
+        // Direct native Shopify /cart/add.js
+        button.addEventListener('click', async function() {
+          const targetVariantId = button.dataset.variantId;
+          if (targetVariantId) {
+            const cleanId = String(targetVariantId).includes('/') ? String(targetVariantId).split('/').pop() : targetVariantId;
+            button.textContent = 'Adding…';
+            button.disabled = true;
+            try {
+              const res = await fetch('/cart/add.js', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json', 'Accept': 'application/json' },
+                body: JSON.stringify({ items: [{ id: cleanId, quantity: 1 }] })
+              });
+              if (res.ok) {
+                button.textContent = '✓ Added';
+                window.dispatchEvent(new CustomEvent('cart:updated'));
+              } else {
+                button.textContent = 'Add to Cart';
+              }
+            } catch (e) {
+              button.textContent = 'Add to Cart';
+            } finally {
+              button.disabled = false;
             }
           }
         });

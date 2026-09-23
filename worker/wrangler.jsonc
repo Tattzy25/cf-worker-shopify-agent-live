@@ -1,0 +1,27 @@
+{
+  "$schema": "node_modules/wrangler/config-schema.json",
+  "name": "shop-chat-agent-worker",
+  "main": "src/index.js",
+  "compatibility_date": "2025-03-01",
+  "compatibility_flags": [
+    "nodejs_compat"
+  ],
+  "observability": {
+    "enabled": true
+  },
+  "kv_namespaces": [
+    {
+      "binding": "MERCHANT_SETTINGS",
+      "id": "76a95c41a6e947e3ba88adfcdddcc5ee"
+    },
+    {
+      "binding": "CHAT_HISTORY",
+      "id": "ceea977f4d614049a14f4bbcaf05269c"
+    }
+  ],
+  "send_email": [
+    {
+      "name": "EMAIL"
+    }
+  ]
+}

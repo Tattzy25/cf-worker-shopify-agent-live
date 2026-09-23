@@ -34,9 +34,12 @@
 <script>
   window.shopChatConfig = {
     promptType: {{ block.settings.system_prompt | json }},
-    welcomeMessage: {{ block.settings.welcome_message | json }}
+    welcomeMessage: {{ block.settings.welcome_message | json }},
+    apiUrl: {{ block.settings.api_url | default: "https://shop-chat-agent-worker.avi-kay2019.workers.dev" | json }}
   };
   window.shopId = {{ shop.id }};
+  window.shopPermanentDomain = {{ shop.permanent_domain | json }};
+  window.shopDomain = {{ shop.domain | json }};
 </script>
 
 {% schema %}
