@@ -2,12 +2,25 @@
   "$schema": "node_modules/wrangler/config-schema.json",
   "name": "shop-chat-agent-worker",
   "main": "src/index.js",
-  "compatibility_date": "2025-03-01",
+  "compatibility_date": "2026-09-28",
   "compatibility_flags": [
     "nodejs_compat"
   ],
+  "routes": [
+    {
+      "pattern": "chat.facetimefy.com",
+      "custom_domain": true
+    }
+  ],
+  "workers_dev": true,
   "observability": {
     "enabled": true
+  },
+  "vars": {
+    "DEFAULT_OPENAI_MODEL": "gpt-5.5",
+    "DEFAULT_GEMINI_MODEL": "gemini-3.8-flash",
+    "SENDER_EMAIL": "error@urgent.facetimefy.com",
+    "SENDER_NAME": "Facetimefy AI Alert"
   },
   "kv_namespaces": [
     {
@@ -22,7 +35,6 @@
   "d1_databases": [
     {
       "binding": "DB",
-      "database_name": "facetimefy",
       "database_id": "a6b8ed18-b53f-4494-8e5a-443798cf6eb5"
     }
   ],
@@ -43,5 +55,22 @@
       "name": "EMAIL",
       "remote": true
     }
-  ]
+  ],
+  "queues": {
+    "producers": [
+      {
+        "binding": "FTC_QUEUE",
+        "queue": "facetimefy"
+      }
+    ],
+    "consumers": [
+      {
+        "queue": "facetimefy",
+        "max_batch_size": 10,
+        "max_batch_timeout": 5,
+        "max_retries": 3,
+        "dead_letter_queue": "ftc-queue-dlq"
+      }
+    ]
+  }
 }
