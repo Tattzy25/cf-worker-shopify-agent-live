@@ -449,11 +449,17 @@ export default function Settings() {
                   onChange={(e) => setModel(e.target?.value || e.detail?.value || e.currentTarget?.value)}
                 >
                   {provider === "gemini" ? (
-                    <s-option value="gemini-3.6-flash">gemini-3.6-flash (Recommended — High-Speed LiveCommerce)</s-option>
+                    <>
+                      <s-option value="gemini-3.8-flash">gemini-3.8-flash</s-option>
+                      <s-option value="gemini-3.7-flash">gemini-3.7-flash</s-option>
+                      <s-option value="gemini-3.6-flash">gemini-3.6-flash</s-option>
+                    </>
                   ) : (
                     <>
-                      <s-option value="gpt-5.5">gpt-5.5 (Recommended for Concierge)</s-option>
-                      <s-option value="gpt-4o-mini">gpt-4o-mini (High-Speed Reasoning)</s-option>
+                      <s-option value="gpt-6-sol">gpt-6-sol</s-option>
+                      <s-option value="gpt-5.5">gpt-5.5</s-option>
+                      <s-option value="gpt-5.4">gpt-5.4</s-option>
+                      <s-option value="gpt-6-astra">gpt-6-astra</s-option>
                     </>
                   )}
                 </s-select>

@@ -15,10 +15,14 @@ export default function ApiKeysSettings({
   setOpenaiKey,
   openaiModel,
   setOpenaiModel,
+  customOpenaiModel,
+  setCustomOpenaiModel,
   geminiKey,
   setGeminiKey,
   geminiModel,
-  setGeminiModel
+  setGeminiModel,
+  customGeminiModel,
+  setCustomGeminiModel
 }) {
   // Local validation states (kept private to this component)
   const [openaiStatus, setOpenaiStatus] = useState("idle"); // "idle" | "verifying" | "valid" | "invalid"
@@ -87,6 +91,12 @@ export default function ApiKeysSettings({
 
   const showOpenAI = providerMode === "openai" || providerMode === "both";
   const showGemini = providerMode === "gemini" || providerMode === "both";
+
+  const standardOpenAiModels = ["gpt-6-sol", "gpt-5.5", "gpt-5.4", "gpt-6-astra"];
+  const standardGeminiModels = ["gemini-3.8-flash", "gemini-3.7-flash", "gemini-3.6-flash"];
+
+  const isOpenAiCustom = openaiModel === "custom" || (openaiModel && !standardOpenAiModels.includes(openaiModel));
+  const isGeminiCustom = geminiModel === "custom" || (geminiModel && !standardGeminiModels.includes(geminiModel));
 
   return (
     <s-section heading="AI Credentials & Model">
@@ -190,10 +200,28 @@ export default function ApiKeysSettings({
             value={openaiModel}
             onChange={(e) => setOpenaiModel(e.target.value)}
           >
-            <s-option value="gpt-5.5" selected={openaiModel === "gpt-5.5"}>GPT-5.5 (Recommended Default)</s-option>
-            <s-option value="gpt-5.4" selected={openaiModel === "gpt-5.4"}>GPT-5.4</s-option>
-            <s-option value="gpt-sol" selected={openaiModel === "gpt-sol"}>GPT-sol</s-option>
+            <s-option value="gpt-6-sol" selected={openaiModel === "gpt-6-sol"}>gpt-6-sol</s-option>
+            <s-option value="gpt-5.5" selected={openaiModel === "gpt-5.5"}>gpt-5.5</s-option>
+            <s-option value="gpt-5.4" selected={openaiModel === "gpt-5.4"}>gpt-5.4</s-option>
+            <s-option value="gpt-6-astra" selected={openaiModel === "gpt-6-astra"}>gpt-6-astra</s-option>
+            <s-option value="custom" selected={isOpenAiCustom}>Custom OpenAI Model Identifier...</s-option>
           </s-select>
+
+          {isOpenAiCustom && (
+            <s-box paddingBlockStart="small-100">
+              <s-text-field
+                label="Custom OpenAI Model Identifier"
+                name="custom_openai_model"
+                value={customOpenaiModel || (openaiModel !== "custom" ? openaiModel : "")}
+                placeholder="e.g. ft:gpt-4o-... or custom model ID"
+                onInput={(e) => {
+                  if (setCustomOpenaiModel) setCustomOpenaiModel(e.target.value);
+                  setOpenaiModel(e.target.value || "custom");
+                }}
+                details="Enter the exact OpenAI model identifier."
+              ></s-text-field>
+            </s-box>
+          )}
         </s-box>
       )}
 
@@ -246,9 +274,27 @@ export default function ApiKeysSettings({
             value={geminiModel}
             onChange={(e) => setGeminiModel(e.target.value)}
           >
-            <s-option value="gemini-3.8-flash" selected={geminiModel === "gemini-3.8-flash"}>Gemini 3.8 Flash (Recommended Default)</s-option>
-            <s-option value="gemini-3.6-flash" selected={geminiModel === "gemini-3.6-flash"}>Gemini 3.6 Flash</s-option>
+            <s-option value="gemini-3.8-flash" selected={geminiModel === "gemini-3.8-flash"}>gemini-3.8-flash</s-option>
+            <s-option value="gemini-3.7-flash" selected={geminiModel === "gemini-3.7-flash"}>gemini-3.7-flash</s-option>
+            <s-option value="gemini-3.6-flash" selected={geminiModel === "gemini-3.6-flash"}>gemini-3.6-flash</s-option>
+            <s-option value="custom" selected={isGeminiCustom}>Custom Gemini Model Identifier...</s-option>
           </s-select>
+
+          {isGeminiCustom && (
+            <s-box paddingBlockStart="small-100">
+              <s-text-field
+                label="Custom Gemini Model Identifier"
+                name="custom_gemini_model"
+                value={customGeminiModel || (geminiModel !== "custom" ? geminiModel : "")}
+                placeholder="e.g. gemini-3.1-pro-preview"
+                onInput={(e) => {
+                  if (setCustomGeminiModel) setCustomGeminiModel(e.target.value);
+                  setGeminiModel(e.target.value || "custom");
+                }}
+                details="Enter the exact Google Gemini model identifier."
+              ></s-text-field>
+            </s-box>
+          )}
         </s-box>
       )}
     </s-section>

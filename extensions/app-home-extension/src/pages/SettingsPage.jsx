@@ -13,10 +13,17 @@ export default function SettingsPage() {
   // AI Provider & Model States
   const [providerMode, setProviderMode] = useState("facetimefy");
   const [primaryChoice, setPrimaryChoice] = useState("openai_primary");
-  const [openaiModel, setOpenaiModel] = useState("gpt-5.5");
+  const [openaiModel, setOpenaiModel] = useState("gpt-6-sol");
+  const [customOpenaiModel, setCustomOpenaiModel] = useState("");
   const [geminiModel, setGeminiModel] = useState("gemini-3.8-flash");
+  const [customGeminiModel, setCustomGeminiModel] = useState("");
   const [openaiKey, setOpenaiKey] = useState("");
   const [geminiKey, setGeminiKey] = useState("");
+
+  // Power Merchant Model & Key States
+  const [powerModel, setPowerModel] = useState("");
+  const [powerApiKey, setPowerApiKey] = useState("");
+  const [customPowerModel, setCustomPowerModel] = useState("");
 
   // System Message & Persona States
   const [personaTone, setPersonaTone] = useState("friendly");
@@ -38,7 +45,12 @@ export default function SettingsPage() {
           if (data.provider_mode) setProviderMode(data.provider_mode);
           if (data.primary_choice) setPrimaryChoice(data.primary_choice);
           if (data.openai_model) setOpenaiModel(data.openai_model);
+          if (data.custom_openai_model) setCustomOpenaiModel(data.custom_openai_model);
           if (data.gemini_model) setGeminiModel(data.gemini_model);
+          if (data.custom_gemini_model) setCustomGeminiModel(data.custom_gemini_model);
+          if (data.power_model) setPowerModel(data.power_model);
+          if (data.power_api_key) setPowerApiKey(data.power_api_key);
+          if (data.custom_power_model) setCustomPowerModel(data.custom_power_model);
           if (data.persona_tone) setPersonaTone(data.persona_tone);
           if (data.greeting_message) setGreetingMessage(data.greeting_message);
           if (data.system_prompt) setSystemPrompt(data.system_prompt);
@@ -64,7 +76,12 @@ export default function SettingsPage() {
     formEntries.provider_mode = providerMode;
     formEntries.primary_choice = primaryChoice;
     formEntries.openai_model = openaiModel;
+    formEntries.custom_openai_model = customOpenaiModel;
     formEntries.gemini_model = geminiModel;
+    formEntries.custom_gemini_model = customGeminiModel;
+    formEntries.power_model = powerModel;
+    formEntries.power_api_key = powerApiKey;
+    formEntries.custom_power_model = customPowerModel;
     formEntries.openai_api_key = openaiKey;
     formEntries.gemini_api_key = geminiKey;
     formEntries.persona_tone = personaTone;
@@ -112,10 +129,14 @@ export default function SettingsPage() {
           setOpenaiKey={setOpenaiKey}
           openaiModel={openaiModel}
           setOpenaiModel={setOpenaiModel}
+          customOpenaiModel={customOpenaiModel}
+          setCustomOpenaiModel={setCustomOpenaiModel}
           geminiKey={geminiKey}
           setGeminiKey={setGeminiKey}
           geminiModel={geminiModel}
           setGeminiModel={setGeminiModel}
+          customGeminiModel={customGeminiModel}
+          setCustomGeminiModel={setCustomGeminiModel}
         />
 
         {/* Module 2: System Message & Store Persona */}
@@ -128,10 +149,16 @@ export default function SettingsPage() {
           setSystemPrompt={setSystemPrompt}
         />
 
-        {/* Module 3: For Power Merchants (MCP Tool Servers) */}
+        {/* Module 3: For Power Merchants (MCP Tool Servers & Custom AI Engine) */}
         <PowerMerchantSettings
           mcpServers={mcpServers}
           setMcpServers={setMcpServers}
+          powerModel={powerModel}
+          setPowerModel={setPowerModel}
+          powerApiKey={powerApiKey}
+          setPowerApiKey={setPowerApiKey}
+          customPowerModel={customPowerModel}
+          setCustomPowerModel={setCustomPowerModel}
         />
 
         {/* Primary Save Button */}

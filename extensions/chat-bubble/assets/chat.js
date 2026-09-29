@@ -1,6 +1,8 @@
 /**
  * Shop AI Chat — Client-Side Storefront LiveCommerce Engine
  *
+ * CRITICAL RULE: On error, show customer: "Connection error. Our team has been notified, please try again in a few minutes." Never ghost the customer.
+ *
  * Merges COMMERCE-ADD (resolve.ts, route.ts, types.ts, LiveCommerce.tsx)
  * with the Shopify Storefront App Extension.
  *
@@ -8,10 +10,10 @@
  *  - 100% real store data & live Master MCP tool output.
  *  - Zero mock, zero simulation, zero fake data.
  *  - Native Shopify cart (/cart.js, /cart/add.js, /cart/change.js).
- *  - Silent error trapping on storefront without polluting customer DOM.
  */
 (function() {
   'use strict';
+
 
   /* ==========================================================================
      1. SCHEMA-TOLERANT RESOLVERS & ROUTER (from COMMERCE-ADD)
@@ -1205,12 +1207,13 @@
         this.removeTypingIndicator();
 
         if (!response.ok) {
-          // STRICT ZERO CUSTOMER-FACING ERRORS: silently clear indicator
+          this.ingest({ message: "Connection error. Our team has been notified, please try again in a few minutes." });
           return;
         }
 
-        const data = await response.json();
+        const data = await response.json().catch(() => ({ error: true }));
         if (data.error) {
+          this.ingest({ message: "Connection error. Our team has been notified, please try again in a few minutes." });
           return;
         }
 
@@ -1224,6 +1227,7 @@
 
       } catch (_) {
         this.removeTypingIndicator();
+        this.ingest({ message: "Connection error. Our team has been notified, please try again in a few minutes." });
       }
     },
 

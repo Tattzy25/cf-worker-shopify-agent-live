@@ -56,3 +56,15 @@ CREATE INDEX IF NOT EXISTS idx_conversations_shop ON conversations(shop);
 CREATE INDEX IF NOT EXISTS idx_error_logs_shop ON error_logs(shop);
 CREATE INDEX IF NOT EXISTS idx_ai_sales_shop ON ai_assisted_sales(shop, event_type);
 CREATE INDEX IF NOT EXISTS idx_demand_shop ON customer_demand_insights(shop, matched_items_count);
+
+-- Internal System & Platform Error Logs (Developer & Infrastructure Only - Never Sent to Merchants)
+CREATE TABLE IF NOT EXISTS system_error_logs (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  subsystem TEXT NOT NULL,
+  error TEXT NOT NULL,
+  details TEXT,
+  created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+);
+
+CREATE INDEX IF NOT EXISTS idx_system_error_logs_subsystem ON system_error_logs(subsystem);
+

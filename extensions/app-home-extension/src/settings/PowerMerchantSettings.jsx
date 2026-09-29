@@ -1,8 +1,49 @@
 // @ts-nocheck
 import { useState } from "preact/hooks";
-import { validateMcpServer } from "../api/settingsApi.js";
+import { validateMcpServer, validateApiKey } from "../api/settingsApi.js";
 
-export default function PowerMerchantSettings({ mcpServers = [], setMcpServers }) {
+export default function PowerMerchantSettings({
+  mcpServers = [],
+  setMcpServers,
+  powerModel = "",
+  setPowerModel,
+  powerApiKey = "",
+  setPowerApiKey,
+  customPowerModel = "",
+  setCustomPowerModel
+}) {
+  // Power API key validation states
+  const [keyStatus, setKeyStatus] = useState("idle"); // "idle" | "verifying" | "valid" | "invalid"
+  const [keyError, setKeyError] = useState("");
+
+  const handleValidateKey = async () => {
+    if (!powerApiKey || !powerApiKey.trim()) {
+      setKeyStatus("idle");
+      setKeyError("");
+      return;
+    }
+    const isGemini = powerModel.startsWith("gemini-") || (powerModel === "custom" && customPowerModel.startsWith("gemini-"));
+    const provider = isGemini ? "gemini" : "openai";
+
+    setKeyStatus("verifying");
+    setKeyError("");
+
+    const shop = typeof window !== "undefined" ? new URLSearchParams(window.location.search).get("shop") : null;
+    const res = await validateApiKey(provider, powerApiKey, shop);
+    if (res.valid) {
+      setKeyStatus("valid");
+      setKeyError("");
+    } else {
+      setKeyStatus("invalid");
+      setKeyError(res.error || "Invalid API key for selected provider.");
+    }
+  };
+
+  const isGeminiModel = powerModel.startsWith("gemini-") || (powerModel === "custom" && customPowerModel.startsWith("gemini-"));
+  const keyLabel = isGeminiModel ? "Google Gemini API Key" : "OpenAI API Key";
+  const keyPlaceholder = isGeminiModel ? "AIzaSy..." : "sk-...";
+  const keyLink = isGeminiModel ? "https://aistudio.google.com/api-keys" : "https://platform.openai.com/api-keys";
+
   // New server inputs
   const [serverUrl, setServerUrl] = useState("");
   const [serverLabel, setServerLabel] = useState("");
@@ -95,6 +136,94 @@ export default function PowerMerchantSettings({ mcpServers = [], setMcpServers }
   return (
     <s-section heading="For Power Merchants">
       <s-stack direction="block" gap="base">
+
+        {/* Module: Power Merchant AI Engine */}
+        <s-box padding="base" border="base" borderRadius="base">
+          <s-stack direction="block" gap="base">
+            <s-heading>Power Merchant AI Engine</s-heading>
+            <s-paragraph color="subdued">
+              Override standard store models with an advanced agentic model and dedicated API key.
+            </s-paragraph>
+
+            <s-select
+              label="Select AI Model"
+              name="power_model"
+              value={powerModel}
+              onChange={(e) => {
+                const val = e.target?.value || e.detail?.value || e.currentTarget?.value;
+                setPowerModel(val);
+                if (keyStatus !== "idle") setKeyStatus("idle");
+                if (keyError) setKeyError("");
+              }}
+            >
+              <s-option value="">Inherit Standard Store Settings (Default)</s-option>
+              <s-option value="gpt-6-sol" selected={powerModel === "gpt-6-sol"}>gpt-6-sol</s-option>
+              <s-option value="gpt-5.5" selected={powerModel === "gpt-5.5"}>gpt-5.5</s-option>
+              <s-option value="gpt-5.4" selected={powerModel === "gpt-5.4"}>gpt-5.4</s-option>
+              <s-option value="gpt-6-astra" selected={powerModel === "gpt-6-astra"}>gpt-6-astra</s-option>
+              <s-option value="gemini-3.6-flash" selected={powerModel === "gemini-3.6-flash"}>gemini-3.6-flash</s-option>
+              <s-option value="gemini-3.7-flash" selected={powerModel === "gemini-3.7-flash"}>gemini-3.7-flash</s-option>
+              <s-option value="gemini-3.8-flash" selected={powerModel === "gemini-3.8-flash"}>gemini-3.8-flash</s-option>
+              <s-option value="custom" selected={powerModel === "custom"}>Custom Model...</s-option>
+            </s-select>
+
+            {powerModel === "custom" && (
+              <s-text-field
+                label="Custom Model Identifier"
+                name="custom_power_model"
+                value={customPowerModel}
+                placeholder="e.g. ft:gpt-4o-... or gemini-3.1-pro-preview"
+                onInput={(e) => setCustomPowerModel(e.target.value)}
+                details="Enter the exact model identifier string."
+              ></s-text-field>
+            )}
+
+            {powerModel && (
+              <s-box paddingBlockStart="small-100">
+                <s-grid gridTemplateColumns="1fr auto" gap="base" alignItems="end">
+                  <s-password-field
+                    label={keyLabel}
+                    name="power_api_key"
+                    value={powerApiKey}
+                    placeholder={keyPlaceholder}
+                    autocomplete="off"
+                    error={keyError || undefined}
+                    onInput={(e) => {
+                      setPowerApiKey(e.target.value);
+                      if (keyStatus !== "idle") setKeyStatus("idle");
+                      if (keyError) setKeyError("");
+                    }}
+                    onBlur={handleValidateKey}
+                  ></s-password-field>
+                  <s-button
+                    onClick={(e) => {
+                      e.preventDefault();
+                      handleValidateKey();
+                    }}
+                    loading={keyStatus === "verifying" ? true : undefined}
+                  >
+                    Verify Key
+                  </s-button>
+                </s-grid>
+                {keyStatus === "verifying" && (
+                  <s-box paddingBlockStart="extra-tight">
+                    <s-text color="subdued">Verifying key with {isGeminiModel ? "Google Gemini" : "OpenAI"}...</s-text>
+                  </s-box>
+                )}
+                {keyStatus === "valid" && (
+                  <s-box paddingBlockStart="extra-tight">
+                    <s-text tone="success">✓ API key verified & active</s-text>
+                  </s-box>
+                )}
+                <s-box paddingBlockStart="extra-tight">
+                  <s-link href={keyLink} target="_blank">
+                    {keyLabel}
+                  </s-link>
+                </s-box>
+              </s-box>
+            )}
+          </s-stack>
+        </s-box>
 
         {/* Connect MCP Server Box */}
         <s-box padding="base" border="base" borderRadius="base">

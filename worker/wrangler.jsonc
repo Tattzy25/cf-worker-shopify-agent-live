@@ -72,5 +72,11 @@
         "dead_letter_queue": "ftc-queue-dlq"
       }
     ]
-  }
+  },
+  "pipelines": [
+    {
+      "binding": "POWER_MERCHANT_STREAM",
+      "stream": "power_merchant"
+    }
+  ]
 }

@@ -6,11 +6,13 @@
  * - /admin/settings     : Merchant configuration persistence (D1 + KV edge cache)
  * - /chat               : Storefront AI shopping assistant endpoint
  */
-import { recordAndAlertError, dispatchAlertEmail, handleInboundEmail } from "./email.js";
+import { recordAndAlertError, recordSystemError, dispatchAlertEmail, handleInboundEmail } from "./email.js";
 import { buildSystemPrompt, OPENAI_TOOLS, MASTER_MCP_URL } from "./prompt.js";
+import { handleValidateMcp } from "./powerMerchant.js";
+import { streamSettingsEvent, streamToolCallEvent } from "./pipeline.js";
 
 export default {
-  async fetch(request, env) {
+  async fetch(request, env, ctx) {
     // 1. CORS Preflight
     if (request.method === "OPTIONS") {
       return new Response(null, {
@@ -142,152 +144,10 @@ export default {
 
       // -------------------------------------------------------------
       // ROUTE: Live On-The-Spot MCP Server Validation & Tool Discovery
-      // POST /admin/validate-mcp
+      // POST /admin/validate-mcp (delegated to powerMerchant.js)
       // -------------------------------------------------------------
-      if (url.pathname === "/admin/validate-mcp" && request.method === "POST") {
-        const body = await request.json().catch(() => ({}));
-        const { url: serverUrl, headers: customHeaders, shop: bodyShop, notification_email: bodyEmail } = body;
-        const shop = bodyShop || request.headers.get("X-Shopify-Shop-Domain") || url.searchParams.get("shop") || null;
-
-        if (!serverUrl || typeof serverUrl !== "string" || !serverUrl.startsWith("http")) {
-          return new Response(
-            JSON.stringify({ valid: false, error: "Please enter a valid HTTP(S) server URL" }),
-            { status: 400, headers }
-          );
-        }
-
-        try {
-          const fetchHeaders = {
-            "Content-Type": "application/json",
-            "Accept": "application/json, text/event-stream"
-          };
-          if (customHeaders && typeof customHeaders === "object") {
-            Object.assign(fetchHeaders, customHeaders);
-          }
-
-          // Query MCP tools list via JSON-RPC 2.0
-          const mcpRes = await fetch(serverUrl, {
-            method: "POST",
-            headers: fetchHeaders,
-            body: JSON.stringify({
-              jsonrpc: "2.0",
-              id: 1,
-              method: "tools/list",
-              params: {}
-            })
-          });
-
-          if (!mcpRes.ok) {
-            const upstreamError = `MCP server returned HTTP ${mcpRes.status}`;
-            await recordAndAlertError(env, {
-              shop,
-              provider: "mcp",
-              rawError: upstreamError,
-              context: "MCP Server Validation",
-              merchantEmail: bodyEmail,
-              sendEmail: false
-            });
-
-            if (env.ANALYTICS_ENGINE_CHAT) {
-              try {
-                env.ANALYTICS_ENGINE_CHAT.writeDataPoint({
-                  indexes: [shop || "unknown"],
-                  blobs: ["mcp_validation", serverUrl, "error", upstreamError],
-                  doubles: [0, 1]
-                });
-              } catch (_) {}
-            }
-
-            return new Response(
-              JSON.stringify({
-                valid: false,
-                error: upstreamError
-              }),
-              { headers }
-            );
-          }
-
-          const resText = await mcpRes.text();
-          let tools = [];
-
-          // Handle SSE streamable HTTP output (event: message \n data: {...})
-          if (resText.includes("data:")) {
-            const dataLines = resText.split("\n").filter(l => l.startsWith("data:"));
-            for (const line of dataLines) {
-              try {
-                const parsed = JSON.parse(line.replace(/^data:\s*/, ""));
-                if (parsed.result?.tools) {
-                  tools = parsed.result.tools;
-                  break;
-                }
-              } catch (_) {}
-            }
-          } else {
-            try {
-              const parsed = JSON.parse(resText);
-              if (parsed.result?.tools) tools = parsed.result.tools;
-            } catch (_) {}
-          }
-
-          if (env.ANALYTICS_ENGINE_CHAT) {
-            try {
-              env.ANALYTICS_ENGINE_CHAT.writeDataPoint({
-                indexes: [shop || "unknown"],
-                blobs: ["mcp_validation", serverUrl, "success", String(tools.length)],
-                doubles: [tools.length, 1]
-              });
-            } catch (_) {}
-          }
-
-          // Asynchronous Queue Offload: Enqueue background tool cache sync
-          if (env.FTC_QUEUE && shop) {
-            try {
-              await env.FTC_QUEUE.send({
-                type: "MCP_SYNC",
-                shop,
-                serverUrl,
-                customHeaders: customHeaders || {},
-                serverId: body.id || null
-              });
-            } catch (_) {}
-          }
-
-          return new Response(
-            JSON.stringify({
-              valid: true,
-              tools
-            }),
-            { headers }
-          );
-        } catch (err) {
-          const errMsg = `Failed to connect to MCP server: ${err?.message || String(err)}`;
-          await recordAndAlertError(env, {
-            shop,
-            provider: "mcp",
-            rawError: errMsg,
-            context: "MCP Network Connection Failure",
-            merchantEmail: bodyEmail,
-            sendEmail: false
-          });
-
-          if (env.ANALYTICS_ENGINE_CHAT) {
-            try {
-              env.ANALYTICS_ENGINE_CHAT.writeDataPoint({
-                indexes: [shop || "unknown"],
-                blobs: ["mcp_validation", serverUrl, "error", errMsg],
-                doubles: [0, 1]
-              });
-            } catch (_) {}
-          }
-
-          return new Response(
-            JSON.stringify({
-              valid: false,
-              error: errMsg
-            }),
-            { headers }
-          );
-        }
+      if (url.pathname === "/admin/validate-mcp") {
+        return await handleValidateMcp(request, env, headers);
       }
 
       // -------------------------------------------------------------
@@ -302,8 +162,22 @@ export default {
             return new Response(JSON.stringify({ error: "Missing store identifier" }), { status: 400, headers });
           }
 
-          // Strict KV read
+          // Strict KV read of basic settings
           const config = await env.MERCHANT_SETTINGS.get(shop, { type: "json" });
+
+          // R2 Isolated Merchant Folder: Read MCP servers from merchants/${shop}/mcp_servers.json
+          let mcpServers = [];
+          if (env.CONVERSATIONS_BUCKET) {
+            try {
+              const r2Obj = await env.CONVERSATIONS_BUCKET.get(`merchants/${shop}/mcp_servers.json`);
+              if (r2Obj) {
+                mcpServers = await r2Obj.json();
+              }
+            } catch (_) {}
+          }
+          if (!mcpServers.length && config?.mcp_servers) {
+            mcpServers = config.mcp_servers;
+          }
 
           const defaultOpenAiModel = env.DEFAULT_OPENAI_MODEL || "gpt-5.5";
           const defaultGeminiModel = env.DEFAULT_GEMINI_MODEL || "gemini-3.8-flash";
@@ -313,14 +187,19 @@ export default {
               provider_mode: "facetimefy",
               primary_choice: "openai_primary",
               openai_model: defaultOpenAiModel,
+              custom_openai_model: "",
               gemini_model: defaultGeminiModel,
+              custom_gemini_model: "",
+              power_model: "",
+              custom_power_model: "",
+              has_power_key: false,
               has_openai_key: false,
               has_gemini_key: false,
               notification_email: "",
               persona_tone: "friendly",
               greeting_message: "",
               system_prompt: "",
-              mcp_servers: []
+              mcp_servers: mcpServers
             }), { headers });
           }
 
@@ -329,14 +208,19 @@ export default {
             provider_mode: config.provider_mode || "facetimefy",
             primary_choice: config.primary_choice || "openai_primary",
             openai_model: config.openai_model || defaultOpenAiModel,
+            custom_openai_model: config.custom_openai_model || "",
             gemini_model: config.gemini_model || defaultGeminiModel,
+            custom_gemini_model: config.custom_gemini_model || "",
+            power_model: config.power_model || "",
+            custom_power_model: config.custom_power_model || "",
+            has_power_key: Boolean(config.power_api_key),
             has_openai_key: Boolean(config.openai_api_key),
             has_gemini_key: Boolean(config.gemini_api_key),
             notification_email: config.notification_email || "",
             persona_tone: config.persona_tone || "friendly",
             greeting_message: config.greeting_message || "",
             system_prompt: config.system_prompt || "",
-            mcp_servers: config.mcp_servers || []
+            mcp_servers: mcpServers
           }), { headers });
         }
 
@@ -362,11 +246,29 @@ export default {
             ? (payload.gemini_api_key?.trim() || null)
             : (existing?.gemini_api_key || null);
 
-          let mcpServers = existing?.mcp_servers || [];
+          const powerKey = payload.power_api_key !== undefined
+            ? (payload.power_api_key?.trim() || null)
+            : (existing?.power_api_key || null);
+
+          let mcpServers = [];
           if (payload.mcp_servers !== undefined) {
             try {
               mcpServers = typeof payload.mcp_servers === "string" ? JSON.parse(payload.mcp_servers) : payload.mcp_servers;
             } catch (_) {}
+          } else if (existing?.mcp_servers) {
+            mcpServers = existing.mcp_servers;
+          }
+
+          // 1. Save isolated MCP configuration directly to R2 under merchant folder
+          if (env.CONVERSATIONS_BUCKET && mcpServers) {
+            await env.CONVERSATIONS_BUCKET.put(
+              `merchants/${shop}/mcp_servers.json`,
+              JSON.stringify(mcpServers, null, 2),
+              {
+                httpMetadata: { contentType: "application/json" },
+                customMetadata: { shop, updated_at: new Date().toISOString() }
+              }
+            );
           }
 
           const record = {
@@ -374,7 +276,12 @@ export default {
             provider_mode: payload.provider_mode || "facetimefy",
             primary_choice: payload.primary_choice || existing?.primary_choice || "openai_primary",
             openai_model: payload.openai_model || existing?.openai_model || defaultOpenAiModel,
+            custom_openai_model: payload.custom_openai_model || existing?.custom_openai_model || "",
             gemini_model: payload.gemini_model || existing?.gemini_model || defaultGeminiModel,
+            custom_gemini_model: payload.custom_gemini_model || existing?.custom_gemini_model || "",
+            power_model: payload.power_model || existing?.power_model || "",
+            custom_power_model: payload.custom_power_model || existing?.custom_power_model || "",
+            power_api_key: powerKey,
             openai_api_key: openaiKey,
             gemini_api_key: geminiKey,
             notification_email: payload.notification_email || existing?.notification_email || "",
@@ -387,6 +294,14 @@ export default {
 
           // Strict KV write
           await env.MERCHANT_SETTINGS.put(shop, JSON.stringify(record));
+
+          // Cloudflare Pipelines: Stream configuration event into R2
+          streamSettingsEvent(env, ctx, {
+            shop,
+            powerModel: payload.power_model || "",
+            provider: payload.power_model?.startsWith("gemini-") ? "gemini" : "openai",
+            mcpServers
+          });
 
           // Queue Producer: Offload asynchronous D1 sync
           if (env.FTC_QUEUE) {
@@ -434,10 +349,29 @@ export default {
           let apiKey = env.OPENAI_API_KEY;
           let modelName = env.DEFAULT_OPENAI_MODEL || "gpt-5.5";
 
-          if (providerMode === "openai") {
+          // Power Merchant: Directly serve from database/KV if configured
+          if (config?.power_model) {
+            const raw = config.power_model === "custom" && config.custom_power_model 
+              ? config.custom_power_model 
+              : config.power_model;
+            const isGemini = raw.startsWith("gemini-");
+            provider = isGemini ? "gemini" : "openai";
+            apiKey = config.power_api_key;
+            modelName = raw;
+            if (!apiKey) {
+              await recordAndAlertError(env, {
+                shop,
+                provider,
+                rawError: `Power Merchant API Key for ${provider} (${modelName}) is missing or unconfigured.`,
+                context: "Storefront Chat Execution",
+                merchantEmail: config?.notification_email
+              });
+              return new Response(JSON.stringify({ error: true }), { headers });
+            }
+          } else if (providerMode === "openai") {
             provider = "openai";
             apiKey = config.openai_api_key;
-            modelName = config.openai_model || "gpt-5.5";
+            modelName = (config.openai_model === "custom" && config.custom_openai_model ? config.custom_openai_model : config.openai_model) || "gpt-6-sol";
             if (!apiKey) {
               await recordAndAlertError(env, {
                 shop,
@@ -446,12 +380,12 @@ export default {
                 context: "Storefront Chat Execution",
                 merchantEmail: config.notification_email
               });
-              return new Response(JSON.stringify({ error: "Service unavailable" }), { status: 500, headers });
+              return new Response(JSON.stringify({ error: true }), { headers });
             }
           } else if (providerMode === "gemini") {
             provider = "gemini";
             apiKey = config.gemini_api_key;
-            modelName = config.gemini_model || "gemini-3.8-flash";
+            modelName = (config.gemini_model === "custom" && config.custom_gemini_model ? config.custom_gemini_model : config.gemini_model) || "gemini-3.8-flash";
             if (!apiKey) {
               await recordAndAlertError(env, {
                 shop,
@@ -460,14 +394,14 @@ export default {
                 context: "Storefront Chat Execution",
                 merchantEmail: config.notification_email
               });
-              return new Response(JSON.stringify({ error: "Service unavailable" }), { status: 500, headers });
+              return new Response(JSON.stringify({ error: true }), { headers });
             }
           } else {
             provider = "openai";
             apiKey = env.OPENAI_API_KEY;
             modelName = env.DEFAULT_OPENAI_MODEL || "gpt-5.5";
             if (!apiKey) {
-              return new Response(JSON.stringify({ error: "Platform key unconfigured" }), { status: 500, headers });
+              return new Response(JSON.stringify({ error: true }), { headers });
             }
           }
 
@@ -475,6 +409,41 @@ export default {
           let history = [];
           if (env.CHAT_HISTORY) {
             history = (await env.CHAT_HISTORY.get(convId, { type: "json" })) || [];
+          }
+
+          // R2 Isolated Merchant Folder: Load MCP servers and tools
+          let mcpServers = [];
+          if (env.CONVERSATIONS_BUCKET) {
+            try {
+              const r2Obj = await env.CONVERSATIONS_BUCKET.get(`merchants/${shop}/mcp_servers.json`);
+              if (r2Obj) {
+                mcpServers = await r2Obj.json();
+              }
+            } catch (_) {}
+          }
+          if (!mcpServers.length && config?.mcp_servers) {
+            mcpServers = config.mcp_servers;
+          }
+
+          // Map active MCP tools
+          const activeMcpTools = [];
+          const mcpToolMap = new Map();
+          for (const s of mcpServers) {
+            if (s.status === "ready" && Array.isArray(s.tools)) {
+              for (const t of s.tools) {
+                if (t.name) {
+                  activeMcpTools.push({
+                    type: "function",
+                    function: {
+                      name: t.name,
+                      description: t.description || "",
+                      parameters: t.inputSchema || { type: "object", properties: {} }
+                    }
+                  });
+                  mcpToolMap.set(t.name, { url: s.url, headers: s.headers || {} });
+                }
+              }
+            }
           }
 
           const systemPrompt = buildSystemPrompt({
@@ -486,20 +455,26 @@ export default {
           let reply = "";
 
           if (provider === "openai") {
+            const requestBody = {
+              model: modelName,
+              messages: [
+                { role: "system", content: systemPrompt },
+                ...history,
+                { role: "user", content: userMessage }
+              ]
+            };
+
+            if (activeMcpTools.length > 0) {
+              requestBody.tools = activeMcpTools;
+            }
+
             const aiRes = await fetch("https://api.openai.com/v1/chat/completions", {
               method: "POST",
               headers: {
                 "Content-Type": "application/json",
                 "Authorization": `Bearer ${apiKey}`
               },
-              body: JSON.stringify({
-                model: modelName,
-                messages: [
-                  { role: "system", content: systemPrompt },
-                  ...history,
-                  { role: "user", content: userMessage }
-                ]
-              })
+              body: JSON.stringify(requestBody)
             });
 
             if (!aiRes.ok) {
@@ -511,11 +486,90 @@ export default {
                 context: "Storefront Chat Completion",
                 merchantEmail: config?.notification_email
               });
-              return new Response(JSON.stringify({ error: "Failed to generate response" }), { status: 502, headers });
+              return new Response(JSON.stringify({ error: true }), { status: aiRes.status, headers });
             }
 
             const aiData = await aiRes.json();
-            reply = aiData.choices?.[0]?.message?.content || "";
+            const choice = aiData.choices?.[0]?.message;
+
+            // Handle MCP tool invocation
+            if (choice?.tool_calls && choice.tool_calls.length > 0) {
+              const toolMessages = [
+                { role: "system", content: systemPrompt },
+                ...history,
+                { role: "user", content: userMessage },
+                choice
+              ];
+
+              for (const tc of choice.tool_calls) {
+                const target = mcpToolMap.get(tc.function?.name);
+                let toolOutput = "";
+                if (target) {
+                  try {
+                    const mcpRes = await fetch(target.url, {
+                      method: "POST",
+                      headers: {
+                        "Content-Type": "application/json",
+                        ...target.headers
+                      },
+                      body: JSON.stringify({
+                        jsonrpc: "2.0",
+                        id: 1,
+                        method: "tools/call",
+                        params: {
+                          name: tc.function.name,
+                          arguments: JSON.parse(tc.function.arguments || "{}")
+                        }
+                      })
+                    });
+                    const mcpData = await mcpRes.json();
+                    toolOutput = JSON.stringify(mcpData?.result || mcpData?.error || mcpData);
+                  } catch (tErr) {
+                    toolOutput = JSON.stringify({ error: String(tErr) });
+                  }
+                } else {
+                  toolOutput = JSON.stringify({ error: "Tool not found" });
+                }
+
+                toolMessages.push({
+                  role: "tool",
+                  tool_call_id: tc.id,
+                  content: toolOutput
+                });
+              }
+
+              const followUpRes = await fetch("https://api.openai.com/v1/chat/completions", {
+                method: "POST",
+                headers: {
+                  "Content-Type": "application/json",
+                  "Authorization": `Bearer ${apiKey}`
+                },
+                body: JSON.stringify({
+                  model: modelName,
+                  messages: toolMessages
+                })
+              });
+
+              if (followUpRes.ok) {
+                const followUpData = await followUpRes.json();
+                reply = followUpData.choices?.[0]?.message?.content || "";
+              } else {
+                reply = choice.content || "";
+              }
+
+              // Cloudflare Pipelines: Stream tool execution event into R2
+              streamToolCallEvent(env, ctx, {
+                shop,
+                modelName,
+                provider,
+                serversCount: mcpServers.length,
+                toolsCount: activeMcpTools.length,
+                conversationId: convId,
+                toolCalls: choice.tool_calls
+              });
+            } else {
+              reply = choice?.content || "";
+            }
           } else if (provider === "gemini") {
             const aiRes = await fetch(
               `https://generativelanguage.googleapis.com/v1beta/models/${modelName}:generateContent?key=${apiKey}`,
@@ -544,7 +598,7 @@ export default {
                 context: "Storefront Chat Completion",
                 merchantEmail: config?.notification_email
               });
-              return new Response(JSON.stringify({ error: "Failed to generate response" }), { status: 502, headers });
+              return new Response(JSON.stringify({ error: true }), { status: aiRes.status, headers });
             }
 
             const aiData = await aiRes.json();
@@ -627,16 +681,12 @@ export default {
       // Default Health Check
       return new Response(JSON.stringify({ status: "ready", worker: "shop-chat-agent-worker" }), { headers });
     } catch (err) {
-      console.error("[Worker Unhandled Error]", err);
-      const url = new URL(request.url);
-      const shop = url.searchParams.get("shop") || request.headers.get("X-Shopify-Shop-Domain") || null;
-      await recordAndAlertError(env, {
-        shop,
-        provider: "internal",
+      await recordSystemError(env, {
+        subsystem: "worker_router",
         rawError: err?.message || String(err),
-        context: "Worker Router Unhandled"
+        details: { url: request.url, method: request.method }
       });
-      return new Response(JSON.stringify({ error: "Internal Server Error" }), {
+      return new Response(JSON.stringify({ error: true }), {
         status: 500,
         headers
       });
@@ -688,15 +738,39 @@ export default {
           ).run();
         }
 
+        // Subscribed Event: ERROR_ALERT
+        if (body?.type === "ERROR_ALERT") {
+          if (env.DB) {
+            await env.DB.prepare(`
+              INSERT INTO error_logs (shop, conversation_id, user_message, error, created_at)
+              VALUES (?, ?, ?, ?, CURRENT_TIMESTAMP)
+            `).bind(
+              body.shop || "system",
+              body.conversationId || null,
+              body.context || "Error Alert",
+              body.rawError || "Unknown error"
+            ).run().catch((dbErr) => console.error("[Queue D1 Log Error]", dbErr));
+          }
+
+          if (body.sendEmail !== false && env.EMAIL) {
+            await dispatchAlertEmail(env, {
+              shop: body.shop,
+              provider: body.provider,
+              rawError: body.rawError,
+              context: body.context,
+              conversationId: body.conversationId,
+              merchantEmail: body.merchantEmail
+            }).catch((emailErr) => console.error("[Queue Alert Email Error]", emailErr));
+          }
+        }
+
         message.ack();
       } catch (err) {
-        console.error(`[Queue Error] Failed processing message ${message.id}:`, err);
         const body = message.body;
-        await recordAndAlertError(env, {
-          shop: body?.shop || null,
-          provider: "queue",
+        await recordSystemError(env, {
+          subsystem: "queue_consumer",
           rawError: err?.message || String(err),
-          context: `Background D1 Sync (Message ${message.id})`
+          details: { messageId: message.id, type: body?.type }
         });
         message.retry();
       }

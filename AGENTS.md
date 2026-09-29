@@ -121,6 +121,15 @@ CREATE TABLE IF NOT EXISTS customer_demand_insights (
   outcome TEXT NOT NULL,
   created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
 );
+
+-- Internal System & Platform Error Logs (Developer & Infrastructure Only - Never Sent to Merchants)
+CREATE TABLE IF NOT EXISTS system_error_logs (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  subsystem TEXT NOT NULL, -- 'pipeline', 'worker_router', 'queue_consumer'
+  error TEXT NOT NULL,
+  details TEXT,
+  created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);
 ```
 
 ---
@@ -133,4 +142,5 @@ CREATE TABLE IF NOT EXISTS customer_demand_insights (
 - **Client Script (`extensions/chat-bubble/assets/chat.js`):**
   - Pure JSON request/response over standard `fetch` (Zero SSE).
   - Handles `/cart/add.js` for seamless native Shopify cart operations.
-  - Silently catches errors without polluting the shopper DOM.
+  - On connection or server error: never ghosts the customer; displays `"Connection error. Our team has been notified, please try again in a few minutes."`
+

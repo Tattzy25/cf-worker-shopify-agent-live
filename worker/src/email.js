@@ -131,27 +131,9 @@ export async function recordAndAlertError(env, {
     errorString = String(rawError || "Unknown error");
   }
 
-  // Asynchronous Queue Offload: If FTC_QUEUE binding is present, enqueue event for background processing
-  if (env.FTC_QUEUE) {
-    try {
-      await env.FTC_QUEUE.send({
-        type: "ERROR_ALERT",
-        shop,
-        provider,
-        rawError: errorString,
-        context,
-        conversationId,
-        merchantEmail,
-        sendEmail
-      });
-      return;
-    } catch (queueErr) {
-      console.error("[Queue Enqueue Failed] Falling back to direct handling:", queueErr);
-    }
-  }
-
-  // Fallback direct execution if Queue is unavailable
   const targetShop = shop || "system";
+
+  // Direct D1 Error Logging
   if (env.DB) {
     try {
       await env.DB.prepare(`
@@ -168,18 +150,50 @@ export async function recordAndAlertError(env, {
     }
   }
 
-  if (sendEmail) {
+  // Direct Email Alert Dispatch
+  if (sendEmail && env.EMAIL) {
     try {
       await dispatchAlertEmail(env, {
-        shop,
+        shop: targetShop,
         provider,
         rawError: errorString,
         context,
         conversationId,
         merchantEmail
       });
-    } catch (emailErr) {
-      console.error("[Alert Email Dispatch Failed]", emailErr);
-    }
+    } catch (_) {}
   }
 }
+
+/**
+ * Internal System Error Logger (Platform / Developer Only)
+ * Writes internal platform failures (Pipelines, storage, unhandled worker exceptions)
+ * directly into the dedicated `system_error_logs` D1 table.
+ * STRICT RULE: NEVER alerts the merchant or customer.
+ */
+export async function recordSystemError(env, {
+  subsystem = "internal",
+  rawError,
+  details = null
+}) {
+  if (!env?.DB) return;
+
+  const errorString = typeof rawError === "string" 
+    ? rawError 
+    : (rawError?.message || JSON.stringify(rawError));
+    
+  const detailsString = details 
+    ? (typeof details === "string" ? details : JSON.stringify(details)) 
+    : null;
+
+  await env.DB.prepare(`
+    INSERT INTO system_error_logs (subsystem, error, details, created_at)
+    VALUES (?, ?, ?, CURRENT_TIMESTAMP)
+  `).bind(
+    subsystem,
+    errorString,
+    detailsString
+  ).run();
+}
+
+
