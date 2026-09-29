@@ -1,0 +1,86 @@
+# app home extension
+
+A simple app home extension that demonstrates:
+- Basic UI with Shopify's Remote DOM components
+- URL-based client-side routing with preact-iso
+- App sub-navigation with `s-app-nav`
+- KV storage for persisting data
+
+## Features
+
+This extension creates a FAQ manager directly in your app's home page:
+
+- **Add FAQs**: Create question and answer pairs
+- **List FAQs**: View all stored FAQs
+- **Edit FAQs**: Update existing question and answer pairs
+- **Delete FAQs**: Remove FAQs you no longer need
+- **Persist data**: Uses `shopify.storage` API to store data
+- **Local assets**: Demonstrates loading images from the extension's assets folder
+- **Client-side routing**: Uses preact-iso to route between the FAQ list, add/edit FAQ, settings, and not-found pages
+
+## Using Local Assets
+
+This template demonstrates loading images from your extension's `assets/` folder. Images are referenced using paths relative to the directory you specify:
+
+```jsx
+<s-image src="./my-image.png" alt="Description" />
+```
+
+Place your images in the `assets/` folder at the root of your extension directory:
+
+```
+app-home/
+├── assets/
+│   ├── graphql-logo.png
+│   ├── polaris-icon.png
+│   └── preact-logo.png
+├── src/
+│   └── AppHome.liquid
+└── ...
+```
+
+## Storage API
+
+This extension uses Shopify's [Storage API](https://shopify.dev/docs/api/admin-extensions/2026-04-rc/target-apis/core-apis/standard-api#standardapi-propertydetail-storage) to persist FAQ data:
+
+- **App-scoped**: Data is isolated to your app
+- **Simple**: No GraphQL queries needed - `shopify.storage.getItem()` / `shopify.storage.setItem()`
+- **Persistent**: Data survives page reloads
+- **Extension-specific**: Each extension instance has its own storage
+
+## Routing
+
+The extension demonstrates URL-based client-side routing with [preact-iso](https://github.com/preactjs/preact-iso):
+- `/` - Shows all FAQs (default route)
+- `/faq/new` - Form to create a new FAQ
+- `/faq/:id` - Form to edit an existing FAQ
+- `/settings` - Example settings page registered in `s-app-nav`
+
+The router keeps internal app navigation in sync with the Admin URL, so routes can be deep-linked and refreshed.
+
+## Code structure
+
+Route components live in `src/pages/`:
+
+- `src/pages/HomePage.jsx` lists FAQs
+- `src/pages/FAQPage.jsx` handles both `/faq/new` and `/faq/:id`
+- `src/pages/SettingsPage.jsx` renders the `s-app-nav` settings route
+- `src/pages/NotFoundPage.jsx` renders the fallback route
+
+Shared FAQ storage helpers live in `src/models/faqs.js`, and the aside content lives in `src/components/AboutTemplate.jsx`.
+
+## Development
+
+```bash
+# Start dev server
+npm run dev
+
+# Build for production
+npm run build
+```
+
+## Learn More
+
+- [App Home documentation](https://shopify.dev/docs/api/app-home)
+- [Storage API](https://shopify.dev/docs/api/admin-extensions/2026-04-rc/target-apis/core-apis/standard-api#standardapi-propertydetail-storage)
+- [Remote DOM Components](https://shopify.dev/docs/api/app-bridge-library/components)

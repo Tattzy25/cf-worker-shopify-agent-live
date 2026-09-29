@@ -1,0 +1,12 @@
+{
+	"servers": {
+		"chrome mcp": {
+			"command": "npx",
+            "args": [
+            "-y",
+           "chrome-mcp"
+          ]
+		}
+	},
+	"inputs": []
+}

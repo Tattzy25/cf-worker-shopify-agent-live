@@ -1,983 +1,2295 @@
 /**
- * Shop AI Chat - Client-side implementation
+ * Shop AI Chat — Client-Side Storefront LiveCommerce Engine
  *
- * This module handles the chat interface for the Shopify AI Chat application.
- * It manages the UI interactions, API communication, and message rendering.
+ * Merges COMMERCE-ADD (resolve.ts, route.ts, types.ts, LiveCommerce.tsx)
+ * with the Shopify Storefront App Extension.
+ *
+ * Strict Zero-Fallback Protocol:
+ *  - 100% real store data & live Master MCP tool output.
+ *  - Zero mock, zero simulation, zero fake data.
+ *  - Native Shopify cart (/cart.js, /cart/add.js, /cart/change.js).
+ *  - Silent error trapping on storefront without polluting customer DOM.
  */
 (function() {
   'use strict';
 
-  /**
-   * Application namespace to prevent global scope pollution
-   */
+  /* ==========================================================================
+     1. SCHEMA-TOLERANT RESOLVERS & ROUTER (from COMMERCE-ADD)
+     ========================================================================== */
+
+  const nk = (k) => String(k || '').toLowerCase().replace(/[^a-z0-9]/g, '');
+  const isObj = (v) => !!v && typeof v === 'object' && !Array.isArray(v);
+
+  function pickShallow(o, aliases) {
+    if (!isObj(o)) return undefined;
+    const map = new Map();
+    for (const k of Object.keys(o)) map.set(nk(k), k);
+    for (const a of aliases) {
+      const k = map.get(nk(a));
+      if (k !== undefined && o[k] != null && o[k] !== '') return o[k];
+    }
+    return undefined;
+  }
+
+  function pickDeep(o, aliases, maxDepth = 4) {
+    const set = new Set(aliases.map(nk));
+    const queue = [{ v: o, d: 0 }];
+    while (queue.length) {
+      const { v, d } = queue.shift();
+      if (d > maxDepth) continue;
+      if (isObj(v)) {
+        for (const k of Object.keys(v)) {
+          if (set.has(nk(k)) && v[k] != null && v[k] !== '') return v[k];
+        }
+        for (const k of Object.keys(v)) {
+          const c = v[k];
+          if (isObj(c) || Array.isArray(c)) queue.push({ v: c, d: d + 1 });
+        }
+      } else if (Array.isArray(v)) {
+        for (const c of v) {
+          if (isObj(c) || Array.isArray(c)) queue.push({ v: c, d: d + 1 });
+        }
+      }
+    }
+    return undefined;
+  }
+
+  function pick(o, aliases, deep = true) {
+    const s = pickShallow(o, aliases);
+    return s !== undefined ? s : deep ? pickDeep(o, aliases) : undefined;
+  }
+
+  const asString = (v) => {
+    if (v == null) return null;
+    if (typeof v === 'string') return v.trim() || null;
+    if (typeof v === 'number' || typeof v === 'boolean') return String(v);
+    return null;
+  };
+
+  const asNumber = (v) => {
+    if (typeof v === 'number' && isFinite(v)) return v;
+    if (typeof v === 'string') {
+      const m = v.replace(/[^0-9.\-]/g, '');
+      if (m && m !== '-' && !isNaN(parseFloat(m))) return parseFloat(m);
+    }
+    return null;
+  };
+
+  const asStrings = (v) => {
+    if (v == null) return [];
+    if (Array.isArray(v)) return v.map(asStrings).flat().filter(Boolean);
+    const s = asString(v);
+    if (s) return [s];
+    if (isObj(v)) return [asString(pickShallow(v, ['message', 'text', 'title', 'detail'])) || ''].filter(Boolean);
+    return [];
+  };
+
+  function money(n, o) {
+    if (n == null) return null;
+    const cur = asString(pick(o, ['currency', 'currency_code', 'currencyCode', 'iso_currency'], false)) || window.shopInitialData?.currency || 'USD';
+    try {
+      return new Intl.NumberFormat(undefined, { style: 'currency', currency: cur, minimumFractionDigits: 2 }).format(n);
+    } catch (_) {
+      return `$${n.toFixed(2)}`;
+    }
+  }
+
+  const MEDIA_ALIASES = [
+    'image', 'images', 'image_url', 'imageUrl', 'thumbnail', 'thumbnail_url', 'thumbnailUrl',
+    'product_image', 'productImage', 'picture', 'pictures', 'photos', 'media_url', 'mediaUrl',
+    'hero_image', 'primary_image', 'main_image', 'media', 'url', 'src', 'featured_image'
+  ];
+  const urlish = (s) => /^(https?:|data:|\/|blob:)/i.test(s);
+
+  function resolveMedia(o) {
+    const v = pick(o, MEDIA_ALIASES);
+    const out = [];
+    const push = (x) => {
+      const s = asString(x) || (isObj(x) ? asString(pickShallow(x, ['url', 'image', 'src', 'link', 'href'])) : null);
+      if (s && urlish(s) && !out.includes(s)) out.push(s);
+    };
+    if (Array.isArray(v)) v.forEach(push);
+    else if (v !== undefined) push(v);
+    return out;
+  }
+
+  function resolveUrl(o) {
+    const s = asString(pick(o, ['product_url', 'productUrl', 'permalink', 'canonical_url', 'link', 'url', 'handle']));
+    if (!s) return null;
+    if (urlish(s)) return s;
+    if (!s.startsWith('/')) return `/products/${s}`;
+    return s;
+  }
+
+  function resolveTitle(o) {
+    return asString(pick(o, ['title', 'name', 'product_name', 'productName', 'heading', 'display_name', 'displayName', 'item_name', 'label'])) || 'Untitled item';
+  }
+
+  function resolveSeller(o) {
+    const v = pick(o, ['seller', 'seller_name', 'sellerName', 'merchant', 'merchant_name', 'merchantName', 'store', 'store_name', 'brand', 'vendor']);
+    if (isObj(v)) {
+      return asString(pickShallow(v, ['name', 'display_name', 'title', 'store_name'])) || asString(pickShallow(v, ['domain', 'url']));
+    }
+    return asString(v) || window.shopInitialData?.shopName || null;
+  }
+
+  let PRICE_UNIT = 'auto';
+  function unitMode(o, v) {
+    if (isObj(o)) {
+      const h = pickShallow(o, ['price_unit', 'priceUnit', 'unit', 'amount_unit', 'amountUnit', 'scale', 'minor_units', 'minorUnits', 'in_cents', 'inCents']);
+      if (h != null) {
+        const s = String(h).toLowerCase();
+        if (/cent|minor|subunit|^2$/.test(s)) return 'minor';
+        if (/major|whole|dollar|unit|^0$|^1$/.test(s)) return 'major';
+      }
+    }
+    if (PRICE_UNIT !== 'auto') return PRICE_UNIT;
+    if (typeof v === 'number') return Number.isInteger(v) && v > 500 ? 'minor' : 'major';
+    if (typeof v === 'string') return /^\s*-?\d+\s*$/.test(v) && parseInt(v, 10) > 500 ? 'minor' : 'major';
+    return null;
+  }
+
+  function priceFrom(v, o) {
+    if (v == null) return null;
+    const display = isObj(v) ? asString(pickShallow(v, ['display', 'formatted', 'formatted_amount', 'price_display', 'text'])) : null;
+    if (display) return display;
+    let src = v;
+    let cur = o;
+    if (isObj(v)) {
+      src = pickShallow(v, ['amount', 'value', 'price', 'number']);
+      cur = v;
+    }
+    const n = asNumber(src);
+    if (n == null) return null;
+    const mode = unitMode(o, src);
+    return money(mode === 'minor' ? n / 100 : n, cur);
+  }
+
+  function resolvePriceLabel(o) {
+    const display = asString(pick(o, ['price_display', 'priceDisplay', 'formatted_price', 'formattedPrice', 'display_price', 'price_string', 'price_text', 'price_formatted']));
+    if (display) return display;
+    if (isObj(o)) {
+      const centKey = Object.keys(o).find(k => /(_|^)(cents?|minor)(_?$)/i.test(k));
+      if (centKey) {
+        const n = asNumber(o[centKey]);
+        if (n != null) return money(n / 100, o);
+      }
+    }
+    const pv = pick(o, ['price', 'current_price', 'currentPrice', 'sale_price', 'salePrice', 'unit_price', 'price_amount', 'best_price', 'amount']);
+    if (pv !== undefined) {
+      const s = priceFrom(pv, o);
+      if (s) return s;
+    }
+    const min = pick(o, ['min_price', 'price_min', 'from_price', 'starting_price', 'start_price']);
+    if (min !== undefined) {
+      const s = priceFrom(min, o);
+      if (s) return `From ${s}`;
+    }
+    return null;
+  }
+
+  function resolveCompareLabel(o) {
+    const display = asString(pick(o, ['compare_at_display', 'compareAtDisplay', 'was_price_display'], false));
+    if (display) return display;
+    const v = pick(o, ['compare_at', 'compareAt', 'compare_at_price', 'original_price', 'list_price', 'was_price', 'msrp']);
+    return v === undefined ? null : priceFrom(v, o);
+  }
+
+  function resolveRating(o) {
+    let v = pick(o, ['rating', 'ratings', 'average_rating', 'averageRating', 'stars', 'score']);
+    if (isObj(v)) v = pickShallow(v, ['average', 'avg', 'value', 'rating', 'score']);
+    let n = asNumber(v);
+    if (n == null) return null;
+    if (n > 5) n = n > 50 ? n / 20 : n / 10;
+    return Math.round(Math.min(5, Math.max(0, n)) * 10) / 10;
+  }
+
+  function resolveReviews(o) {
+    let v = pick(o, ['reviews', 'review_count', 'reviewCount', 'rating_count', 'ratings_count', 'total_reviews']);
+    if (isObj(v)) v = pickShallow(v, ['count', 'total', 'number', 'quantity']);
+    return asNumber(v);
+  }
+
+  function resolveBadge(o) {
+    const v = pick(o, ['badge', 'badges', 'tag', 'tags', 'promotion']);
+    const list = asStrings(v);
+    return list[0] || null;
+  }
+
+  function resolveAvailability(o) {
+    const v = pick(o, ['availability', 'available', 'in_stock', 'inStock', 'stock_status', 'inventory_status']);
+    if (typeof v === 'boolean') return v ? 'In stock' : 'Out of stock';
+    if (typeof v === 'number') return v > 0 ? `In stock (${v})` : 'Out of stock';
+    return asString(v);
+  }
+
+  function resolveDescription(o) {
+    const v = pick(o, ['description', 'desc', 'summary', 'product_description', 'short_description', 'details', 'body_html']);
+    const list = asStrings(v);
+    if (list.length) {
+      // Clean HTML tags if any
+      const cleaned = list.join(' ').replace(/<[^>]*>?/gm, ' ').replace(/\s+/g, ' ').trim();
+      return cleaned || null;
+    }
+    return null;
+  }
+
+  function resolveOptions(o) {
+    const v = pick(o, ['options', 'option_groups', 'optionGroups', 'variant_options', 'attributes']);
+    const arr = Array.isArray(v) ? v : v && isObj(v) ? Object.entries(v).map(([k, val]) => ({ name: k, values: val })) : [];
+    return arr.map((g, gi) => {
+      const label = asString(pickShallow(g, ['name', 'label', 'option_name', 'title'])) || `Option ${gi + 1}`;
+      let vals = pickShallow(g, ['values', 'options', 'items', 'choices', 'option_values']);
+      if (!Array.isArray(vals) && isObj(vals)) vals = Object.values(vals);
+      if (!Array.isArray(vals) && vals != null) vals = [vals];
+      const valArr = Array.isArray(vals) ? vals : [];
+      const values = valArr.map(x => {
+        const lbl = asString(isObj(x) ? pickShallow(x, ['label', 'value', 'name', 'title']) : x) || '?';
+        return {
+          label: lbl,
+          priceLabel: isObj(x) ? resolvePriceLabel(x) : null,
+          media: isObj(x) ? resolveMedia(x)[0] || null : null,
+          raw: x
+        };
+      }).filter(v2 => v2.label !== '?');
+      return { id: asString(pickShallow(g, ['id', 'code', 'key'])) || `opt${gi}`, label, values, raw: g };
+    }).filter(g => g.values.length > 0);
+  }
+
+  function resolveVariants(o) {
+    const v = pick(o, ['variants', 'variant_list', 'variations', 'skus']);
+    if (!Array.isArray(v)) return [];
+    return v.map((x, i) => {
+      let opts = {};
+      const ov = pickShallow(x, ['options', 'option_values', 'optionValues', 'attributes']);
+      if (Array.isArray(ov)) {
+        for (const e of ov) {
+          if (isObj(e)) {
+            const k = asString(pickShallow(e, ['name', 'label', 'option_name']));
+            const val = asString(pickShallow(e, ['value', 'label2', 'val'])) || asString(pickShallow(e, ['value']));
+            if (k && val) opts[k] = val;
+          }
+        }
+      } else if (isObj(ov)) {
+        for (const [k, val] of Object.entries(ov)) {
+          const s = asString(isObj(val) ? pickShallow(val, ['value', 'label']) : val);
+          if (s) opts[k] = s;
+        }
+      }
+      return {
+        id: asString(pickShallow(x, ['id', 'sku', 'variant_id', 'variantId'])) || `v${i}`,
+        label: asString(pickShallow(x, ['title', 'label', 'name'])) || Object.values(opts).join(' / ') || `Variant ${i + 1}`,
+        options: opts,
+        priceLabel: resolvePriceLabel(x),
+        availability: resolveAvailability(x),
+        media: resolveMedia(x),
+        raw: x
+      };
+    });
+  }
+
+  function normalizeProduct(raw, i = 0) {
+    const o = isObj(raw) ? raw : { title: String(raw) };
+    return {
+      id: asString(pick(o, ['id', 'product_id', 'productId', 'sku', 'uid', 'key'], false)) || `p${i}-${Math.random().toString(36).slice(2, 8)}`,
+      raw: o,
+      title: resolveTitle(o),
+      seller: resolveSeller(o),
+      priceLabel: resolvePriceLabel(o),
+      compareLabel: resolveCompareLabel(o),
+      media: resolveMedia(o),
+      description: resolveDescription(o),
+      rating: resolveRating(o),
+      reviews: resolveReviews(o),
+      badge: resolveBadge(o),
+      availability: resolveAvailability(o),
+      url: resolveUrl(o),
+      options: resolveOptions(o),
+      variants: resolveVariants(o)
+    };
+  }
+
+  function resolveProducts(raw) {
+    let arr = pick(raw, ['products', 'results', 'items', 'product_list', 'productList', 'records', 'listings', 'search_results'], false);
+    if (!Array.isArray(arr) && isObj(arr)) {
+      arr = pick(arr, ['products', 'results', 'items', 'listings'], false);
+    }
+    if (!Array.isArray(arr)) {
+      const cat = pick(raw, ['catalog', 'data', 'response', 'payload'], false);
+      if (isObj(cat)) {
+        arr = pick(cat, ['products', 'results', 'items', 'listings'], false);
+      }
+    }
+    if (!Array.isArray(arr)) {
+      arr = pickDeep(raw, ['products', 'results', 'items', 'listings'], 4);
+    }
+    if (Array.isArray(arr)) return arr.map((x, i) => normalizeProduct(x, i));
+    const single = pickShallow(raw, ['product', 'item', 'detail', 'product_detail']);
+    if (isObj(single)) return [normalizeProduct(single)];
+    return [];
+  }
+
+  function resolveTotals(raw) {
+    const v = pick(raw, ['totals', 'total', 'summary', 'amounts', 'price_totals', 'cart_totals'], false) || pickDeep(raw, ['totals'], 3);
+    const arr = Array.isArray(v) ? v : v != null ? [v] : [];
+    return arr.map((t, i) => {
+      if (!isObj(t)) return { label: 'Total', display: String(t), raw: t };
+      const label = asString(pickShallow(t, ['label', 'type', 'name', 'title'])) || (i === arr.length - 1 ? 'Total' : `Total ${i + 1}`);
+      const display = asString(pickShallow(t, ['display', 'formatted', 'formatted_amount', 'text'])) ||
+        priceFrom(pickShallow(t, ['amount', 'value', 'price', 'total']), t) || '—';
+      return { label, display, raw: t };
+    });
+  }
+
+  function resolveCart(raw) {
+    const cartObj = isObj(pickShallow(raw, ['cart', 'cart_state', 'cartState', 'bag'])) ? pickShallow(raw, ['cart', 'cart_state', 'cartState', 'bag']) : raw;
+    const linesArr = pick(cartObj, ['lines', 'line_items', 'lineItems', 'items', 'cart_items'], false);
+    const lines = (Array.isArray(linesArr) ? linesArr : []).map((l, i) => ({
+      id: asString(pickShallow(l, ['line_id', 'lineId', 'id', 'variant_id', 'key'])) || `l${i}`,
+      raw: l,
+      title: resolveTitle(l),
+      media: resolveMedia(l)[0] || null,
+      qty: asNumber(pickShallow(l, ['quantity', 'qty', 'count', 'units'])) || 1,
+      optionsLabel: asStrings(pickShallow(l, ['selected_options', 'options_label', 'variant_title', 'options'])).join(', ') || null,
+      priceLabel: resolvePriceLabel(l)
+    }));
+    return {
+      raw,
+      lines,
+      totals: resolveTotals(cartObj),
+      messages: asStrings(pick(cartObj, ['messages', 'message', 'notes', 'warnings'], false)),
+      recommendations: resolveProducts(pick(cartObj, ['recommendations', 'recommended', 'related'], false))
+    };
+  }
+
+  function resolveCheckout(raw) {
+    const c = isObj(pickShallow(raw, ['checkout', 'checkout_state'])) ? pickShallow(raw, ['checkout', 'checkout_state']) : raw;
+    const url = asString(pick(c, ['checkout_url', 'checkoutUrl', 'continue_url', 'url', 'link'], false)) || '/checkout';
+    return {
+      raw,
+      url,
+      messages: asStrings(pick(c, ['messages', 'message', 'instructions'], false))
+    };
+  }
+
+  const VIEW_HINTS = {
+    discovery: 'discovery', search: 'discovery', results: 'discovery', catalog: 'discovery',
+    collection: 'discovery', shelf: 'discovery',
+    product: 'detail', detail: 'detail', pdp: 'detail',
+    cartconfirm: 'cartConfirm', addtocart: 'cartConfirm',
+    cart: 'cart', bag: 'cart',
+    checkout: 'checkout',
+    message: 'message'
+  };
+
+  function routeResult(raw, hint) {
+    const base = {
+      view: 'unknown',
+      products: [],
+      product: null,
+      cart: null,
+      checkout: null,
+      messages: asStrings(pick(raw, ['messages', 'message', 'notice'], false)),
+      raw
+    };
+    if (raw == null) return base;
+
+    if (hint && hint.view) return fill(base, hint.view);
+
+    const declared = pickShallow(raw, ['view', 'ui', 'surface', 'render']);
+    const declaredS = typeof declared === 'string' ? VIEW_HINTS[nk(declared)] : undefined;
+    if (declaredS) return fill(base, declaredS);
+
+    const products = resolveProducts(raw);
+    if (products.length > 0) {
+      if (products.length === 1 && pickShallow(raw, ['product', 'item', 'detail'])) {
+        return fill(base, 'detail');
+      }
+      return fill(base, 'discovery');
+    }
+
+    const hasCart = pickShallow(raw, ['cart', 'line_items', 'lineItems', 'lines']);
+    if (hasCart) {
+      const confirmish = /added|success|confirmed/i.test(String(pick(raw, ['status', 'message'], false) || ''));
+      return fill(base, confirmish ? 'cartConfirm' : 'cart');
+    }
+
+    if (pick(raw, ['checkout_url', 'checkoutUrl', 'continue_url'], false)) {
+      return fill(base, 'checkout');
+    }
+
+    if (base.messages.length) return fill(base, 'message');
+    return base;
+  }
+
+  function fill(base, view) {
+    const r = { ...base, view };
+    switch (view) {
+      case 'discovery':
+        r.products = resolveProducts(base.raw);
+        break;
+      case 'detail': {
+        const single = pickShallow(base.raw, ['product', 'item', 'detail']);
+        const list = resolveProducts(base.raw);
+        r.product = normalizeProduct(single || (list[0] ? list[0].raw : base.raw));
+        break;
+      }
+      case 'cartConfirm':
+      case 'cart':
+        r.cart = resolveCart(base.raw);
+        break;
+      case 'checkout':
+        r.checkout = resolveCheckout(base.raw);
+        break;
+    }
+    return r;
+  }
+
+  function getBaseWorkerUrl() {
+    const configured = window.shopChatConfig?.apiUrl || 'https://chat.facetimefy.com';
+    return configured.replace(/\/chat\/?$/, '').replace(/\/+$/, '');
+  }
+
+  function extractProductsFromMarkdown(text) {
+    if (!text || typeof text !== 'string') return { cleanedText: text || '', products: [] };
+    const products = [];
+
+    // 1. Normalize glued table boundaries (e.g., text.| Product or ||---|)
+    let normalized = text
+      .replace(/([.!?])\s*\|/g, '$1\n\n|')
+      .replace(/\|\|+/g, '|\n|')
+      .replace(/\r\n/g, '\n');
+
+    const lines = normalized.split('\n');
+    const nonTableLines = [];
+    const tableBlocks = [];
+    let currentTable = [];
+
+    for (let i = 0; i < lines.length; i++) {
+      const line = lines[i];
+      const trimmed = line.trim();
+      const hasPipes = trimmed.includes('|');
+      const isDivider = hasPipes && /^\|?(\s*:?-+:?\s*\|)+\s*$/.test(trimmed);
+
+      if (hasPipes || (currentTable.length > 0 && (trimmed.startsWith('!') || /^Quantity:\s*\d+/i.test(trimmed) || /^Variant ID:/i.test(trimmed) || /^\$[\d,.]+/i.test(trimmed)))) {
+        currentTable.push(trimmed);
+      } else {
+        if (currentTable.length > 0) {
+          tableBlocks.push([...currentTable]);
+          currentTable = [];
+        }
+        // Don't push standalone residue lines that were right below a table
+        if (!/^Variant ID:\s*`?gid:\/\/shopify/i.test(trimmed) && !/^Quantity:\s*\d+/i.test(trimmed)) {
+          nonTableLines.push(line);
+        }
+      }
+    }
+    if (currentTable.length > 0) {
+      tableBlocks.push(currentTable);
+    }
+
+    // 2. Parse each table block
+    for (const block of tableBlocks) {
+      // Split each line into cells
+      const matrix = [];
+      for (const rawRow of block) {
+        if (/^\|?(\s*:?-+:?\s*\|)+\s*$/.test(rawRow)) continue; // skip divider rows
+        if (!rawRow.includes('|')) {
+          // Single cell continuation
+          if (matrix.length > 0) {
+            matrix[matrix.length - 1].push(rawRow);
+          }
+          continue;
+        }
+        const cells = rawRow.split('|').map(c => c.trim()).filter((c, idx, arr) => {
+          if (idx === 0 && c === '') return false;
+          if (idx === arr.length - 1 && c === '') return false;
+          return true;
+        });
+        if (cells.length > 0) {
+          matrix.push(cells);
+        }
+      }
+
+      if (matrix.length === 0) continue;
+
+      const headerRow = matrix[0] || [];
+      const numCols = Math.max(...matrix.map(r => r.length));
+
+      // Check if transposed table (comparison table where each COLUMN is a product)
+      // Condition: Column count > 1 and headers are actual product titles, NOT generic words
+      const genericWords = /^(product|preview|image|title|price|details?|actions?|buy|link|item|best for|sizes?|scent)$/i;
+      const isTransposed = numCols > 1 && headerRow.some(h => h.length > 3 && !genericWords.test(h));
+
+      if (isTransposed) {
+        // Each column c is 1 product!
+        for (let c = 0; c < numCols; c++) {
+          const title = (headerRow[c] || '').replace(/^!/, '').trim();
+          if (!title || genericWords.test(title)) continue;
+
+          let media = [];
+          let priceLabel = '';
+          let description = '';
+          let variantId = '';
+
+          for (let r = 1; r < matrix.length; r++) {
+            const cell = matrix[r][c] || '';
+            if (!cell) continue;
+
+            // Media
+            const imgMatch = cell.match(/<img[^>]+src=["']([^"']+)["']/i) || cell.match(/!\[([^\]]*)\]\(([^)]+)\)/) || cell.match(/(https?:\/\/[^\s\)\|\"'>]+\.(?:jpg|jpeg|png|webp|gif)(?:\?[^\s\)\|\"'>]*)?)/i);
+            if (imgMatch) {
+              const src = imgMatch[1] || imgMatch[2];
+              if (src && !media.includes(src)) media.push(src);
+            }
+
+            // Price
+            const pMatch = cell.match(/(\$[\d,.]+(?:\s*[-–]\s*\$?[\d,.]+)?(?:\s*[A-Z]{3})?)/i);
+            if (pMatch && !priceLabel) {
+              priceLabel = pMatch[1].trim();
+            }
+
+            // Variant ID
+            const vMatch = cell.match(/gid:\/\/shopify\/ProductVariant\/(\d+)/i) || cell.match(/ID:\s*`?([0-9]+)/i);
+            if (vMatch) {
+              variantId = vMatch[1];
+            }
+
+            // Description / notes
+            if (!cell.startsWith('$') && !cell.startsWith('!') && !cell.includes('http') && cell.length > 15 && cell !== title) {
+              description = description ? `${description} · ${cell}` : cell;
+            }
+          }
+
+          products.push(normalizeProduct({
+            id: variantId || `p-col-${c}`,
+            title,
+            image: media[0] || null,
+            images: media,
+            price_display: priceLabel || null,
+            description: description || null,
+            variants: variantId ? [{ id: variantId, label: title, priceLabel, options: {} }] : []
+          }, products.length));
+        }
+      } else {
+        // Standard row-based or single-item cart confirmation table
+        for (let r = 0; r < matrix.length; r++) {
+          const row = matrix[r];
+          const fullRowText = row.join(' | ');
+
+          // Check if it's a cart confirmation item
+          if (row.length === 1 && r === 0) {
+            const title = row[0].replace(/^!/, '').trim();
+            if (title && !genericWords.test(title)) {
+              let priceLabel = '';
+              let variantId = '';
+              for (let subR = 1; subR < matrix.length; subR++) {
+                const subText = matrix[subR].join(' ');
+                const pMatch = subText.match(/(\$[\d,.]+(?:\s*[-–]\s*\$?[\d,.]+)?(?:\s*[A-Z]{3})?)/i);
+                if (pMatch && !priceLabel) priceLabel = pMatch[1].trim();
+                const vMatch = subText.match(/gid:\/\/shopify\/ProductVariant\/(\d+)/i);
+                if (vMatch) variantId = vMatch[1];
+              }
+              products.push(normalizeProduct({
+                id: variantId || `p-cart-0`,
+                title,
+                price_display: priceLabel || null,
+                variants: variantId ? [{ id: variantId, label: title, priceLabel, options: {} }] : []
+              }, 0));
+              break;
+            }
+          }
+
+          if (r === 0 && row.some(c => genericWords.test(c))) {
+            continue; // Header row
+          }
+
+          let title = '';
+          let media = [];
+          let priceLabel = '';
+          let description = '';
+          let variantId = '';
+
+          const pMatch = fullRowText.match(/(\$[\d,.]+(?:\s*[-–]\s*\$?[\d,.]+)?(?:\s*[A-Z]{3})?)/i);
+          if (pMatch) priceLabel = pMatch[1].trim();
+
+          const vMatch = fullRowText.match(/gid:\/\/shopify\/ProductVariant\/(\d+)/i);
+          if (vMatch) variantId = vMatch[1];
+
+          for (const cell of row) {
+            const imgMatch = cell.match(/<img[^>]+src=["']([^"']+)["']/i) || cell.match(/!\[([^\]]*)\]\(([^)]+)\)/) || cell.match(/(https?:\/\/[^\s\)\|\"'>]+\.(?:jpg|jpeg|png|webp|gif)(?:\?[^\s\)\|\"'>]*)?)/i);
+            if (imgMatch) {
+              const src = imgMatch[1] || imgMatch[2];
+              if (src && !media.includes(src)) media.push(src);
+            }
+
+            const cleanCell = cell.replace(/<[^>]*>/g, '').replace(/!\[.*?\]\(.*?\)/g, '').replace(/\[([^\]]+)\]\(([^)]+)\)/g, '$1').trim();
+            if (!title && cleanCell && cleanCell.length > 2 && cleanCell.length < 90 && !cleanCell.startsWith('$') && !cleanCell.startsWith('!')) {
+              if (!genericWords.test(cleanCell)) {
+                title = cleanCell;
+              }
+            } else if (cleanCell.length > 20 && cleanCell !== title) {
+              description = cleanCell;
+            }
+          }
+
+          if (title || media.length > 0) {
+            products.push(normalizeProduct({
+              id: variantId || `p-row-${r}`,
+              title: title || 'Store Product',
+              image: media[0] || null,
+              images: media,
+              price_display: priceLabel || null,
+              description: description || null,
+              variants: variantId ? [{ id: variantId, label: title, priceLabel, options: {} }] : []
+            }, products.length));
+          }
+        }
+      }
+    }
+
+    // 3. Clean up non-table lines: strip any residual table syntax, pipes, and dashes
+    const cleanedLines = nonTableLines.filter(line => {
+      const trimmed = line.trim();
+      if (!trimmed) return true;
+      if (trimmed.includes('|')) return false;
+      if (/^[-=_*]{3,}$/.test(trimmed)) return false;
+      if (/^Variant ID:\s*`?gid:\/\/shopify/i.test(trimmed)) return false;
+      if (/^Quantity:\s*\d+/i.test(trimmed)) return false;
+      return true;
+    });
+
+    const cleanedText = cleanedLines.join('\n').replace(/\n{3,}/g, '\n\n').trim();
+    return { cleanedText, products };
+  }
+
+  /* ==========================================================================
+     2. STOREFRONT LIVECOMMERCE APPLICATION OBJECT
+     ========================================================================== */
+
   const ShopAIChat = {
-    /**
-     * UI-related elements and functionality
-     */
-    UI: {
-      elements: {},
-      isMobile: false,
+    state: {
+      stage: 'idle',
+      conversationId: null,
+      cart: null,
+      activeProduct: null,
+      selectedOptions: {},
+      lastRaw: null,
+      expandedCollections: false,
+      isListening: false,
+      speechRecognizer: null
+    },
 
-      /**
-       * Initialize UI elements and event listeners
-       * @param {HTMLElement} container - The main container element
-       */
-      init: function(container) {
-        if (!container) return;
+    elements: {},
 
-        // Cache DOM elements
-        this.elements = {
-          container: container,
-          chatBubble: container.querySelector('.shop-ai-chat-bubble'),
-          chatWindow: container.querySelector('.shop-ai-chat-window'),
-          closeButton: container.querySelector('.shop-ai-chat-close'),
-          chatInput: container.querySelector('.shop-ai-chat-input input'),
-          sendButton: container.querySelector('.shop-ai-chat-send'),
-          messagesContainer: container.querySelector('.shop-ai-chat-messages')
-        };
+    init: async function() {
+      const container = document.getElementById('shop-ai-chat-root');
+      if (!container) return;
 
-        // Detect mobile device
-        this.isMobile = /iPhone|iPad|iPod|Android/i.test(navigator.userAgent);
+      this.cacheElements(container);
+      this.setupEventListeners();
+      this.initVoiceRecognition();
 
-        // Set up event listeners
-        this.setupEventListeners();
+      // Sync real Shopify cart count immediately
+      await this.syncNativeCart();
 
-        // Fix for iOS Safari viewport height issues
-        if (this.isMobile) {
-          this.setupMobileViewport();
-        }
-      },
+      // Fire AgentBubbleShown event on launch
+      this.trackAnalytics('AgentBubbleShown');
 
-      /**
-       * Set up all event listeners for UI interactions
-       */
-      setupEventListeners: function() {
-        const { chatBubble, closeButton, chatInput, sendButton, messagesContainer } = this.elements;
+      // Check existing conversation or render welcome screen
+      const storedConvId = sessionStorage.getItem('shopAiConversationId');
+      if (storedConvId) {
+        this.state.conversationId = storedConvId;
+        await this.fetchChatHistory(storedConvId);
+      } else {
+        this.renderWelcomeScreen();
+      }
 
-        // Toggle chat window visibility
-        chatBubble.addEventListener('click', () => this.toggleChatWindow());
+      // Expose global bridge per COMMERCE-ADD specs
+      this.exposeGlobalBridge();
+    },
 
-        // Close chat window
-        closeButton.addEventListener('click', () => this.closeChatWindow());
+    cacheElements: function(container) {
+      this.elements = {
+        container,
+        launcher: document.getElementById('shop-ai-launcher'),
+        window: document.getElementById('shop-ai-window'),
+        closeBtn: document.getElementById('shop-ai-chat-close'),
+        dockToggleBtn: document.getElementById('shop-ai-dock-toggle'),
+        menuBtn: document.getElementById('shop-ai-menu-btn'),
+        dropdownMenu: document.getElementById('shop-ai-dropdown-menu'),
+        menuClearBtn: document.getElementById('shop-ai-menu-clear'),
+        headerCartBtn: document.getElementById('shop-ai-header-cart'),
+        headerCartBadge: document.getElementById('shop-ai-cart-badge'),
+        messagesContainer: document.getElementById('shop-ai-messages'),
+        inputField: document.getElementById('shop-ai-input-field'),
+        sendBtn: document.getElementById('shop-ai-send-btn'),
+        floatingBag: document.getElementById('shop-ai-floating-bag'),
+        floatingBagBadge: document.getElementById('shop-ai-floating-bag-badge'),
+        // Sheets
+        detailSheet: document.getElementById('shop-ai-detail-sheet'),
+        detailSheetClose: document.getElementById('shop-ai-sheet-close'),
+        detailSheetBody: document.getElementById('shop-ai-sheet-body'),
+        detailSheetPrice: document.getElementById('shop-ai-sheet-price'),
+        detailSheetAddBtn: document.getElementById('shop-ai-sheet-add-btn'),
+        detailSheetSeller: document.getElementById('shop-ai-sheet-seller'),
+        cartSheet: document.getElementById('shop-ai-cart-sheet'),
+        cartSheetClose: document.getElementById('shop-ai-cart-sheet-close'),
+        cartSheetBody: document.getElementById('shop-ai-cart-sheet-body'),
+        cartSheetSubtotal: document.getElementById('shop-ai-cart-subtotal'),
+        cartSheetCheckout: document.getElementById('shop-ai-cart-sheet-checkout')
+      };
+    },
 
-        // Send message when pressing Enter in input
-        chatInput.addEventListener('keypress', (e) => {
-          if (e.key === 'Enter' && chatInput.value.trim() !== '') {
-            ShopAIChat.Message.send(chatInput, messagesContainer);
+    setupEventListeners: function() {
+      const {
+        launcher, closeBtn, dockToggleBtn, menuBtn, dropdownMenu, menuClearBtn,
+        headerCartBtn, inputField, sendBtn, floatingBag,
+        detailSheetClose, detailSheetAddBtn, cartSheetClose, cartSheetCheckout
+      } = this.elements;
 
-            // On mobile, handle keyboard
-            if (this.isMobile) {
-              chatInput.blur();
-              setTimeout(() => chatInput.focus(), 300);
-            }
-          }
+      // Toggle Window
+      launcher.addEventListener('click', () => this.toggleWindow(true));
+      closeBtn.addEventListener('click', () => this.toggleWindow(false));
+
+      // Window Size Expand / Dock Toggle
+      if (dockToggleBtn) {
+        dockToggleBtn.addEventListener('click', () => {
+          this.elements.window.classList.toggle('docked-expanded');
         });
+      }
 
-        // Send message when clicking send button
-        sendButton.addEventListener('click', () => {
-          if (chatInput.value.trim() !== '') {
-            ShopAIChat.Message.send(chatInput, messagesContainer);
-
-            // On mobile, focus input after sending
-            if (this.isMobile) {
-              setTimeout(() => chatInput.focus(), 300);
-            }
-          }
+      // Dropdown Menu
+      if (menuBtn && dropdownMenu) {
+        menuBtn.addEventListener('click', (e) => {
+          e.stopPropagation();
+          const isShown = dropdownMenu.style.display === 'block';
+          dropdownMenu.style.display = isShown ? 'none' : 'block';
         });
-
-        // Handle window resize to adjust scrolling
-        window.addEventListener('resize', () => this.scrollToBottom());
-
-        // Add global click handler for auth links
-        document.addEventListener('click', function(event) {
-          if (event.target && event.target.classList.contains('shop-auth-trigger')) {
-            event.preventDefault();
-            if (window.shopAuthUrl) {
-              ShopAIChat.Auth.openAuthPopup(window.shopAuthUrl);
-            }
-          }
+        document.addEventListener('click', () => {
+          dropdownMenu.style.display = 'none';
         });
-      },
+      }
 
-      /**
-       * Setup mobile-specific viewport adjustments
-       */
-      setupMobileViewport: function() {
-        const setViewportHeight = () => {
-          document.documentElement.style.setProperty('--viewport-height', `${window.innerHeight}px`);
-        };
-        window.addEventListener('resize', setViewportHeight);
-        setViewportHeight();
-      },
+      if (menuClearBtn) {
+        menuClearBtn.addEventListener('click', () => {
+          sessionStorage.removeItem('shopAiConversationId');
+          this.state.conversationId = null;
+          this.elements.messagesContainer.innerHTML = '';
+          this.renderWelcomeScreen();
+        });
+      }
 
-      /**
-       * Toggle chat window visibility
-       */
-      toggleChatWindow: function() {
-        const { chatWindow, chatInput } = this.elements;
-
-        chatWindow.classList.toggle('active');
-
-        if (chatWindow.classList.contains('active')) {
-          // Track AgentActive telemetry
-          ShopAIChat.Analytics.track('AgentActive');
-
-          // On mobile, prevent body scrolling and delay focus
-          if (this.isMobile) {
-            document.body.classList.add('shop-ai-chat-open');
-            setTimeout(() => chatInput.focus(), 500);
-          } else {
-            chatInput.focus();
-          }
-          // Always scroll messages to bottom when opening
-          this.scrollToBottom();
-        } else {
-          // Remove body class when closing
-          document.body.classList.remove('shop-ai-chat-open');
+      // Input send
+      const submitMessage = () => {
+        const text = inputField.value.trim();
+        if (text) {
+          this.sendUserMessage(text);
+          inputField.value = '';
         }
-      },
+      };
 
-      /**
-       * Close chat window
-       */
-      closeChatWindow: function() {
-        const { chatWindow, chatInput } = this.elements;
-
-        chatWindow.classList.remove('active');
-
-        // On mobile, blur input to hide keyboard and enable body scrolling
-        if (this.isMobile) {
-          chatInput.blur();
-          document.body.classList.remove('shop-ai-chat-open');
+      sendBtn.addEventListener('click', submitMessage);
+      inputField.addEventListener('keydown', (e) => {
+        if (e.key === 'Enter') {
+          e.preventDefault();
+          submitMessage();
         }
-      },
+      });
 
-      /**
-       * Scroll messages container to bottom
-       */
-      scrollToBottom: function() {
-        const { messagesContainer } = this.elements;
-        setTimeout(() => {
-          messagesContainer.scrollTop = messagesContainer.scrollHeight;
-        }, 100);
-      },
+      // Cart Sheets
+      if (headerCartBtn) {
+        headerCartBtn.addEventListener('click', () => this.openCartSheet());
+      }
+      if (floatingBag) {
+        floatingBag.addEventListener('click', () => this.openCartSheet());
+      }
+      if (cartSheetClose) {
+        cartSheetClose.addEventListener('click', () => this.closeCartSheet());
+      }
+      if (detailSheetClose) {
+        detailSheetClose.addEventListener('click', () => this.closeDetailSheet());
+      }
+      if (detailSheetAddBtn) {
+        detailSheetAddBtn.addEventListener('click', () => this.onDetailAddClick());
+      }
+      if (cartSheetCheckout) {
+        cartSheetCheckout.addEventListener('click', () => this.redirectToCheckout());
+      }
 
-      /**
-       * Show typing indicator in the chat
-       */
-      showTypingIndicator: function() {
-        const { messagesContainer } = this.elements;
+      // Listen for native cart updates from other parts of the store
+      window.addEventListener('cart:updated', () => this.syncNativeCart());
+    },
 
-        const typingIndicator = document.createElement('div');
-        typingIndicator.classList.add('shop-ai-typing-indicator');
-        typingIndicator.innerHTML = '<span></span><span></span><span></span>';
-        messagesContainer.appendChild(typingIndicator);
+    toggleWindow: function(open) {
+      if (open) {
+        this.trackAnalytics('AgentActive');
+        this.elements.window.classList.add('active');
+        this.elements.launcher.style.display = 'none';
+        setTimeout(() => this.elements.inputField?.focus(), 250);
         this.scrollToBottom();
-      },
+      } else {
+        this.elements.window.classList.remove('active');
+        this.elements.launcher.style.display = 'inline-flex';
+        this.closeDetailSheet();
+        this.closeCartSheet();
+      }
+    },
 
-      /**
-       * Remove typing indicator from the chat
-       */
-      removeTypingIndicator: function() {
-        const { messagesContainer } = this.elements;
+    scrollToBottom: function() {
+      const container = this.elements.messagesContainer;
+      if (container) {
+        setTimeout(() => { container.scrollTop = container.scrollHeight; }, 50);
+      }
+    },
 
-        const typingIndicator = messagesContainer.querySelector('.shop-ai-typing-indicator');
-        if (typingIndicator) {
-          typingIndicator.remove();
+    /* ==========================================================================
+       3. NATIVE SHOPIFY CART SYNC & OPERATIONS (Zero Fakes / Zero Mocks)
+       ========================================================================== */
+
+    syncNativeCart: async function() {
+      try {
+        const res = await fetch('/cart.js', { headers: { 'Accept': 'application/json' } });
+        if (!res.ok) return;
+        const cartData = await res.json();
+        this.state.cart = resolveCart(cartData);
+        this.updateCartBadges(cartData.item_count || 0);
+      } catch (_) {}
+    },
+
+    updateCartBadges: function(count) {
+      const { headerCartBadge, floatingBag, floatingBagBadge } = this.elements;
+      if (count > 0) {
+        if (headerCartBadge) {
+          headerCartBadge.textContent = count;
+          headerCartBadge.style.display = 'flex';
         }
-      },
+        if (floatingBag && floatingBagBadge) {
+          floatingBagBadge.textContent = count;
+          floatingBag.style.display = 'flex';
+        }
+      } else {
+        if (headerCartBadge) headerCartBadge.style.display = 'none';
+        if (floatingBag) floatingBag.style.display = 'none';
+      }
+    },
 
-      /**
-       * Display product results in the chat
-       * @param {Array} products - Array of product data objects
-       */
-      displayProductResults: function(products) {
-        const { messagesContainer } = this.elements;
+    addVariantToCart: async function(variantId, productTitle, price) {
+      if (!variantId) return false;
+      let cleanId = String(variantId).includes('/') ? String(variantId).split('/').pop() : String(variantId);
+      const convId = this.state.conversationId || '';
 
-        // Create a wrapper for the product section
-        const productSection = document.createElement('div');
-        productSection.classList.add('shop-ai-product-section');
-        messagesContainer.appendChild(productSection);
+      // If cleanId is not purely numeric (e.g. it was a product handle or slug), resolve variant ID from Shopify
+      if (!/^\d+$/.test(cleanId)) {
+        try {
+          const res = await fetch(`/products/${cleanId}.js`, { headers: { 'Accept': 'application/json' } });
+          if (res.ok) {
+            const data = await res.json();
+            if (data.variants && data.variants.length > 0) {
+              cleanId = String(data.variants[0].id);
+            }
+          }
+        } catch (_) {}
+      }
 
-        // Add a header for the product results
-        const header = document.createElement('div');
-        header.classList.add('shop-ai-product-header');
-        header.innerHTML = '<h4>Top Matching Products</h4>';
-        productSection.appendChild(header);
+      if (!/^\d+$/.test(cleanId)) return false;
 
-        // Create the product grid container
-        const productsContainer = document.createElement('div');
-        productsContainer.classList.add('shop-ai-product-grid');
-        productSection.appendChild(productsContainer);
+      try {
+        const res = await fetch('/cart/add.js', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json', 'Accept': 'application/json' },
+          body: JSON.stringify({
+            items: [{
+              id: cleanId,
+              quantity: 1,
+              properties: {
+                '_source': 'facetimefy',
+                '_assisted_by': 'Facetimefy Concierge',
+                '_conversation_id': convId
+              }
+            }]
+          })
+        });
 
-        if (!products || !Array.isArray(products) || products.length === 0) {
-          const noProductsMessage = document.createElement('p');
-          noProductsMessage.textContent = "No products found";
-          noProductsMessage.style.padding = "10px";
-          productsContainer.appendChild(noProductsMessage);
-        } else {
-          products.forEach(product => {
-            const productCard = ShopAIChat.Product.createCard(product);
-            productsContainer.appendChild(productCard);
+        if (res.ok) {
+          // Stamp cart attributes
+          try {
+            await fetch('/cart/update.js', {
+              method: 'POST',
+              headers: { 'Content-Type': 'application/json', 'Accept': 'application/json' },
+              body: JSON.stringify({
+                attributes: {
+                  '_source': 'facetimefy',
+                  '_conversation_id': convId,
+                  'utm_source': 'facetimefy',
+                  'utm_medium': 'concierge'
+                }
+              })
+            });
+          } catch (_) {}
+
+          await this.syncNativeCart();
+          window.dispatchEvent(new CustomEvent('cart:updated'));
+          this.trackAnalytics('AgentAddToCartClick', {
+            product_title: productTitle || '',
+            price: parseFloat(String(price || 0).replace(/[^0-9.]/g, '')) || 0,
+            quantity: 1
           });
+          return true;
         }
-
-        this.scrollToBottom();
+        return false;
+      } catch (err) {
+        return false;
       }
     },
 
-    /**
-     * Message handling and display functionality
-     */
-    Message: {
-      /**
-       * Send a message to the API
-       * @param {HTMLInputElement} chatInput - The input element
-       * @param {HTMLElement} messagesContainer - The messages container
-       */
-      send: async function(chatInput, messagesContainer) {
-        const userMessage = chatInput.value.trim();
-        const conversationId = sessionStorage.getItem('shopAiConversationId');
-
-        // Add user message to chat
-        this.add(userMessage, 'user', messagesContainer);
-
-        // Track in-chat message
-        ShopAIChat.Analytics.track('LiveMessagesSent');
-
-        // Clear input
-        chatInput.value = '';
-
-        // Show typing indicator
-        ShopAIChat.UI.showTypingIndicator();
-
-        try {
-          await ShopAIChat.API.sendMessage(userMessage, conversationId, messagesContainer);
-        } catch (error) {
-          console.error(error);
-          ShopAIChat.UI.removeTypingIndicator();
+    changeCartQuantity: async function(lineKey, quantity) {
+      try {
+        const res = await fetch('/cart/change.js', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json', 'Accept': 'application/json' },
+          body: JSON.stringify({ id: lineKey, quantity })
+        });
+        if (res.ok) {
+          const updated = await res.json();
+          this.state.cart = resolveCart(updated);
+          this.updateCartBadges(updated.item_count || 0);
+          this.renderCartSheetBody();
+          window.dispatchEvent(new CustomEvent('cart:updated'));
         }
-      },
+      } catch (_) {}
+    },
 
-      /**
-       * Add a message to the chat
-       * @param {string} text - Message content
-       * @param {string} sender - Message sender ('user' or 'assistant')
-       * @param {HTMLElement} messagesContainer - The messages container
-       * @returns {HTMLElement} The created message element
-       */
-      add: function(text, sender, messagesContainer) {
-        const messageElement = document.createElement('div');
-        messageElement.classList.add('shop-ai-message', sender);
+    redirectToCheckout: function() {
+      this.trackAnalytics('AgentCheckout');
+      // Stamp URL with Facetimefy attribution and redirect
+      try {
+        const checkoutUrl = new URL('/checkout', window.location.origin);
+        checkoutUrl.searchParams.set('utm_source', 'facetimefy');
+        checkoutUrl.searchParams.set('utm_medium', 'concierge');
+        checkoutUrl.searchParams.set('utm_campaign', 'chat_assistant');
+        window.location.href = checkoutUrl.toString();
+      } catch (_) {
+        window.location.href = '/checkout';
+      }
+    },
 
-        if (sender === 'assistant') {
-          messageElement.dataset.rawText = text;
-          ShopAIChat.Formatting.formatMessageContent(messageElement);
-        } else {
-          messageElement.textContent = text;
+    /* ==========================================================================
+       4. WELL-KNOWN DISCOVERY & CLICKABLE CATEGORY CAROUSEL (media_1790664441190.png)
+       ========================================================================== */
+
+    discoverWellKnown: async function() {
+      if (this.state.wellKnownData) return this.state.wellKnownData;
+      try {
+        const stored = sessionStorage.getItem('shop_well_known_manifest');
+        if (stored) {
+          this.state.wellKnownData = JSON.parse(stored);
+          return this.state.wellKnownData;
         }
+      } catch (_) {}
 
-        messagesContainer.appendChild(messageElement);
-        ShopAIChat.UI.scrollToBottom();
+      try {
+        const res = await fetch('/.well-known/ucp', { headers: { 'Accept': 'application/json' } });
+        if (res.ok) {
+          const data = await res.json();
+          const ucp = data.ucp || data;
 
-        return messageElement;
-      },
-
-      /**
-       * Add a tool use message to the chat with expandable arguments
-       * @param {string} toolMessage - Tool use message content
-       * @param {HTMLElement} messagesContainer - The messages container
-       */
-      addToolUse: function(toolMessage, messagesContainer) {
-        // Parse the tool message to extract tool name and arguments
-        const match = toolMessage.match(/Calling tool: (\w+) with arguments: (.+)/);
-        if (!match) {
-          // Fallback for unexpected format
-          const toolUseElement = document.createElement('div');
-          toolUseElement.classList.add('shop-ai-message', 'tool-use');
-          toolUseElement.textContent = toolMessage;
-          messagesContainer.appendChild(toolUseElement);
-          ShopAIChat.UI.scrollToBottom();
-          return;
-        }
-
-        const toolName = match[1];
-        const argsString = match[2];
-
-        // Create the main tool use element
-        const toolUseElement = document.createElement('div');
-        toolUseElement.classList.add('shop-ai-message', 'tool-use');
-
-        // Create the header (always visible)
-        const headerElement = document.createElement('div');
-        headerElement.classList.add('shop-ai-tool-header');
-
-        const toolText = document.createElement('span');
-        toolText.classList.add('shop-ai-tool-text');
-        toolText.textContent = `Calling tool: ${toolName}`;
-
-        const toggleElement = document.createElement('span');
-        toggleElement.classList.add('shop-ai-tool-toggle');
-        toggleElement.textContent = '[+]';
-
-        headerElement.appendChild(toolText);
-        headerElement.appendChild(toggleElement);
-
-        // Create the arguments section (initially hidden)
-        const argsElement = document.createElement('div');
-        argsElement.classList.add('shop-ai-tool-args');
-
-        try {
-          // Try to format JSON arguments nicely
-          const parsedArgs = JSON.parse(argsString);
-          argsElement.textContent = JSON.stringify(parsedArgs, null, 2);
-        } catch (e) {
-          // If not valid JSON, just show as-is
-          argsElement.textContent = argsString;
-        }
-
-        // Add click handler to toggle arguments visibility
-        headerElement.addEventListener('click', function() {
-          const isExpanded = argsElement.classList.contains('expanded');
-          if (isExpanded) {
-            argsElement.classList.remove('expanded');
-            toggleElement.textContent = '[+]';
-          } else {
-            argsElement.classList.add('expanded');
-            toggleElement.textContent = '[-]';
+          let canonicalDomain = null;
+          const shoppingService = ucp.services?.['dev.ucp.shopping']?.find(s => s.transport === 'mcp') || ucp.services?.['dev.ucp.shopping']?.[0];
+          if (shoppingService?.endpoint) {
+            try { canonicalDomain = new URL(shoppingService.endpoint).hostname; } catch (_) {}
           }
+          if (!canonicalDomain && ucp.supported_versions) {
+            const firstVerUrl = Object.values(ucp.supported_versions)[0];
+            if (firstVerUrl) {
+              try { canonicalDomain = new URL(firstVerUrl).hostname; } catch (_) {}
+            }
+          }
+
+          const gpayInfo = ucp.payment_handlers?.['com.google.pay']?.[0]?.config?.merchant_info;
+          const merchantName = gpayInfo?.merchant_name || '';
+
+          const result = {
+            storeDomain: canonicalDomain || window.location.hostname,
+            merchantName: merchantName,
+            mcpEndpoint: shoppingService?.endpoint || null
+          };
+
+          this.state.wellKnownData = result;
+          try { sessionStorage.setItem('shop_well_known_manifest', JSON.stringify(result)); } catch (_) {}
+          return result;
+        }
+      } catch (_) {}
+
+      const fallback = {
+        storeDomain: window.location.hostname,
+        merchantName: window.shopInitialData?.shopName || '',
+        mcpEndpoint: null
+      };
+      this.state.wellKnownData = fallback;
+      return fallback;
+    },
+
+    discoverCollectionsFromPage: async function() {
+      // 100% dynamic discovery from current page — ZERO database persistence
+      let collections = (window.shopInitialData?.collections || []).filter(c => c && c.handle !== 'frontpage');
+      if (collections.length > 0 && collections.some(c => c.image)) {
+        return collections;
+      }
+
+      try {
+        const res = await fetch('/collections.json', { headers: { 'Accept': 'application/json' } });
+        if (res.ok) {
+          const data = await res.json();
+          const fetched = (data.collections || []).filter(c => c && c.handle !== 'frontpage').map(c => ({
+            id: c.id,
+            title: c.title,
+            handle: c.handle,
+            url: `/collections/${c.handle}`,
+            products_count: c.products_count,
+            image: c.image ? (c.image.src || c.image) : null
+          }));
+
+          if (fetched.length > 0) {
+            // Fill any missing images with first product image from that collection
+            for (const col of fetched.slice(0, 8)) {
+              if (!col.image) {
+                try {
+                  const pRes = await fetch(`/collections/${col.handle}/products.json?limit=1`);
+                  if (pRes.ok) {
+                    const pData = await pRes.json();
+                    if (pData.products?.[0]?.images?.[0]?.src) {
+                      col.image = pData.products[0].images[0].src;
+                    }
+                  }
+                } catch (_) {}
+              }
+            }
+            return fetched;
+          }
+        }
+      } catch (_) {}
+
+      return collections;
+    },
+
+    renderWelcomeScreen: async function() {
+      const container = this.elements.messagesContainer;
+      container.innerHTML = '';
+
+      const wrap = document.createElement('div');
+      wrap.className = 'shop-ai-welcome-card';
+
+      // Discovered merchant name from .well-known/ucp or page initial data
+      const wellKnown = await this.discoverWellKnown();
+      const storeName = wellKnown.merchantName || window.shopInitialData?.shopName || 'Store';
+
+      // Dynamically update header and placeholder
+      const headerTitle = this.elements.container?.querySelector('.shop-ai-header-title');
+      if (headerTitle && !headerTitle.dataset.customized) {
+        headerTitle.textContent = `${storeName} AI`;
+      }
+      if (this.elements.inputField) {
+        this.elements.inputField.placeholder = `Message ${storeName} AI...`;
+      }
+
+      const heading = document.createElement('h3');
+      heading.className = 'shop-ai-welcome-title';
+      heading.textContent = `Welcome to ${storeName} 👋`;
+      wrap.appendChild(heading);
+
+      const sub = document.createElement('p');
+      sub.className = 'shop-ai-welcome-sub';
+      sub.textContent = 'Ask me anything you are interested in.';
+      wrap.appendChild(sub);
+
+      // Category / Collection Carousel (Discovered dynamically from page — ZERO database)
+      const collections = await this.discoverCollectionsFromPage();
+      this.trackAnalytics('AgentNudgeShown', { collections_count: collections.length });
+
+      if (collections.length > 0) {
+        const shelfWrap = document.createElement('div');
+        shelfWrap.className = 'shop-ai-category-shelf-wrap';
+
+        const shelf = document.createElement('div');
+        shelf.className = 'shop-ai-category-shelf lc-no-sb';
+
+        collections.forEach(col => {
+          const card = document.createElement('div');
+          card.className = 'shop-ai-category-card';
+          card.setAttribute('role', 'button');
+          card.setAttribute('tabindex', '0');
+
+          const thumb = document.createElement('div');
+          thumb.className = 'shop-ai-category-thumb';
+          if (col.image) {
+            const img = document.createElement('img');
+            img.src = col.image;
+            img.alt = col.title;
+            img.loading = 'lazy';
+            thumb.appendChild(img);
+          } else {
+            thumb.textContent = '🛍️';
+          }
+          card.appendChild(thumb);
+
+          const title = document.createElement('div');
+          title.className = 'shop-ai-category-title';
+          title.textContent = col.title;
+          card.appendChild(title);
+
+          // Clicking category card asks the assistant
+          card.addEventListener('click', () => {
+            this.trackAnalytics('AgentResponseClick', { prompt: `Tell me more about ${col.title}` });
+            this.sendUserMessage(`Tell me more about ${col.title}`);
+          });
+
+          shelf.appendChild(card);
         });
 
-        // Assemble the complete element
-        toolUseElement.appendChild(headerElement);
-        toolUseElement.appendChild(argsElement);
+        shelfWrap.appendChild(shelf);
 
-        messagesContainer.appendChild(toolUseElement);
-        ShopAIChat.UI.scrollToBottom();
-      }
-    },
-
-    /**
-     * Text formatting and markdown handling
-     */
-    Formatting: {
-      /**
-       * Format message content with markdown and links
-       * @param {HTMLElement} element - The element to format
-       */
-      formatMessageContent: function(element) {
-        if (!element || !element.dataset.rawText) return;
-
-        const rawText = element.dataset.rawText;
-
-        // Process the text with various Markdown features
-        let processedText = rawText;
-
-        // Process Markdown links
-        const markdownLinkRegex = /\[([^\]]+)\]\(([^)]+)\)/g;
-        processedText = processedText.replace(markdownLinkRegex, (match, text, url) => {
-          // Check if it's an auth URL
-          if (url.includes('shopify.com/authentication') &&
-             (url.includes('oauth/authorize') || url.includes('authentication'))) {
-            // Store the auth URL in a global variable for later use - this avoids issues with onclick handlers
-            window.shopAuthUrl = url;
-            // Just return normal link that will be handled by the document click handler
-            return '<a href="#auth" class="shop-auth-trigger">' + text + '</a>';
-          }
-          // If it's a checkout link, replace the text
-          else if (url.includes('/cart') || url.includes('checkout')) {
-            return '<a href="' + url + '" target="_blank" rel="noopener noreferrer">click here to proceed to checkout</a>';
-          } else {
-            // For normal links, preserve the original text
-            return '<a href="' + url + '" target="_blank" rel="noopener noreferrer">' + text + '</a>';
-          }
+        // Scroll right button
+        const scrollBtn = document.createElement('button');
+        scrollBtn.className = 'shop-ai-category-scroll-btn';
+        scrollBtn.innerHTML = '&#8250;';
+        scrollBtn.setAttribute('aria-label', 'Scroll categories');
+        scrollBtn.addEventListener('click', () => {
+          shelf.scrollBy({ left: 160, behavior: 'smooth' });
         });
+        shelfWrap.appendChild(scrollBtn);
 
-        // Convert text to HTML with proper list handling
-        processedText = this.convertMarkdownToHtml(processedText);
-
-        // Apply the formatted HTML
-        element.innerHTML = processedText;
-      },
-
-      /**
-       * Convert Markdown text to HTML with list support
-       * @param {string} text - Markdown text to convert
-       * @returns {string} HTML content
-       */
-      convertMarkdownToHtml: function(text) {
-        text = text.replace(/(\*\*|__)(.*?)\1/g, '<strong>$2</strong>');
-        const lines = text.split('\n');
-        let currentList = null;
-        let listItems = [];
-        let htmlContent = '';
-        let startNumber = 1;
-
-        for (let i = 0; i < lines.length; i++) {
-          const line = lines[i];
-          const unorderedMatch = line.match(/^\s*([-*])\s+(.*)/);
-          const orderedMatch = line.match(/^\s*(\d+)[\.)]\s+(.*)/);
-
-          if (unorderedMatch) {
-            if (currentList !== 'ul') {
-              if (currentList === 'ol') {
-                htmlContent += `<ol start="${startNumber}">` + listItems.join('') + '</ol>';
-                listItems = [];
-              }
-              currentList = 'ul';
-            }
-            listItems.push('<li>' + unorderedMatch[2] + '</li>');
-          } else if (orderedMatch) {
-            if (currentList !== 'ol') {
-              if (currentList === 'ul') {
-                htmlContent += '<ul>' + listItems.join('') + '</ul>';
-                listItems = [];
-              }
-              currentList = 'ol';
-              startNumber = parseInt(orderedMatch[1], 10);
-            }
-            listItems.push('<li>' + orderedMatch[2] + '</li>');
-          } else {
-            if (currentList) {
-              htmlContent += currentList === 'ul'
-                ? '<ul>' + listItems.join('') + '</ul>'
-                : `<ol start="${startNumber}">` + listItems.join('') + '</ol>';
-              listItems = [];
-              currentList = null;
-            }
-
-            if (line.trim() === '') {
-              htmlContent += '<br>';
-            } else {
-              htmlContent += '<p>' + line + '</p>';
-            }
-          }
-        }
-
-        if (currentList) {
-          htmlContent += currentList === 'ul'
-            ? '<ul>' + listItems.join('') + '</ul>'
-            : `<ol start="${startNumber}">` + listItems.join('') + '</ol>';
-        }
-
-        htmlContent = htmlContent.replace(/<\/p><p>/g, '</p>\n<p>');
-        return htmlContent;
+        wrap.appendChild(shelfWrap);
       }
+
+      container.appendChild(wrap);
     },
 
-    /**
-     * API communication and data handling
-     */
-    API: {
-      getApiUrl: function(path) {
-        const configUrl = window.shopChatConfig && window.shopChatConfig.apiUrl;
-        if (configUrl && configUrl.trim()) {
-          const base = configUrl.replace(/\/+$/, '');
-          return base.endsWith('/chat') ? base : `${base}${path}`;
-        }
-        return `https://shop-chat-agent-worker.avi-kay2019.workers.dev${path}`;
-      },
+    /* ==========================================================================
+       5. CHAT MESSAGING & API DISPATCH
+       ========================================================================== */
 
-      /**
-       * Send a message to the API and process standard JSON response
-       * @param {string} userMessage - User's message text
-       * @param {string} conversationId - Conversation ID for context
-       * @param {HTMLElement} messagesContainer - The messages container
-       */
-      sendMessage: async function(userMessage, conversationId, messagesContainer) {
-        const apiUrl = this.getApiUrl('/chat');
-        const shopDomain = window.shopPermanentDomain || window.shopDomain || window.location.hostname;
+    sendUserMessage: async function(text) {
+      const container = this.elements.messagesContainer;
 
+      // Track LiveMessageSent
+      this.trackAnalytics('LiveMessageSent', { message: text });
+
+      // 1. Append user message bubble (Screenshot 2: dark bubble on right)
+      this.appendUserMessage(text);
+      this.scrollToBottom();
+
+      // 2. Show typing indicator
+      this.showTypingIndicator();
+
+      // 3. API Dispatch to Cloudflare Worker (using well-known discovered domain)
+      const apiUrl = `${getBaseWorkerUrl()}/chat`;
+      const wellKnown = await this.discoverWellKnown();
+      const storeDomain = wellKnown.storeDomain || window.location.hostname;
+
+      try {
         const response = await fetch(apiUrl, {
           method: 'POST',
           headers: {
             'Content-Type': 'application/json',
             'Accept': 'application/json',
-            'X-Shopify-Shop-Domain': shopDomain
+            'X-Shopify-Shop-Domain': storeDomain
           },
           body: JSON.stringify({
-            message: userMessage,
-            conversation_id: conversationId,
-            store_domain: shopDomain
+            message: text,
+            conversation_id: this.state.conversationId,
+            store_domain: storeDomain
           })
         });
 
-        ShopAIChat.UI.removeTypingIndicator();
+        this.removeTypingIndicator();
 
         if (!response.ok) {
-          const errText = await response.text();
-          console.error('Chat request failed:', response.status, errText);
+          // STRICT ZERO CUSTOMER-FACING ERRORS: silently clear indicator
           return;
         }
 
         const data = await response.json();
         if (data.error) {
-          console.error('Chat error:', data.error);
           return;
         }
 
         if (data.conversation_id) {
+          this.state.conversationId = data.conversation_id;
           sessionStorage.setItem('shopAiConversationId', data.conversation_id);
         }
 
-        if (data.message) {
-          ShopAIChat.Message.add(data.message, 'assistant', messagesContainer);
-        }
+        // 4. Ingest and route response through LiveCommerce engine
+        this.ingest(data);
 
-        if (data.products && Array.isArray(data.products) && data.products.length > 0) {
-          ShopAIChat.UI.displayProductResults(data.products);
-        }
-      },
-
-      /**
-       * Fetch chat history from the server
-       * @param {string} conversationId - Conversation ID
-       * @param {HTMLElement} messagesContainer - The messages container
-       */
-      fetchChatHistory: async function(conversationId, messagesContainer) {
-        try {
-          // Show a loading message
-          const loadingMessage = document.createElement('div');
-          loadingMessage.classList.add('shop-ai-message', 'assistant');
-          loadingMessage.textContent = "Loading conversation history...";
-          messagesContainer.appendChild(loadingMessage);
-
-          // Fetch history from the server
-          const historyUrl = `${this.getApiUrl('/chat')}?conversation_id=${encodeURIComponent(conversationId)}`;
-          console.log('Fetching history from:', historyUrl);
-
-          const response = await fetch(historyUrl, {
-            method: 'GET',
-            headers: {
-              'Accept': 'application/json',
-              'Content-Type': 'application/json'
-            },
-            mode: 'cors'
-          });
-
-          if (!response.ok) {
-            console.error('History fetch failed:', response.status, response.statusText);
-            throw new Error('Failed to fetch chat history: ' + response.status);
-          }
-
-          const data = await response.json();
-
-          // Remove loading message
-          messagesContainer.removeChild(loadingMessage);
-
-          // No messages, show welcome message
-          if (!data.messages || data.messages.length === 0) {
-            const welcomeMessage = window.shopChatConfig?.welcomeMessage || "👋 Hi there! How can I help you today?";
-            ShopAIChat.Message.add(welcomeMessage, 'assistant', messagesContainer);
-            return;
-          }
-
-          // Add messages to the UI - filter out tool results
-          data.messages.forEach(message => {
-            try {
-              const messageContents = JSON.parse(message.content);
-              for (const contentBlock of messageContents) {
-                if (contentBlock.type === 'text') {
-                  ShopAIChat.Message.add(contentBlock.text, message.role, messagesContainer);
-                }
-              }
-            } catch (e) {
-              ShopAIChat.Message.add(message.content, message.role, messagesContainer);
-            }
-          });
-
-          // Scroll to bottom
-          ShopAIChat.UI.scrollToBottom();
-
-        } catch (error) {
-          console.error('Error fetching chat history:', error);
-
-          // Remove loading message if it exists
-          const loadingMessage = messagesContainer.querySelector('.shop-ai-message.assistant');
-          if (loadingMessage && loadingMessage.textContent === "Loading conversation history...") {
-            messagesContainer.removeChild(loadingMessage);
-          }
-
-          // Show error and welcome message
-          const welcomeMessage = window.shopChatConfig?.welcomeMessage || "👋 Hi there! How can I help you today?";
-          ShopAIChat.Message.add(welcomeMessage, 'assistant', messagesContainer);
-
-          // Clear the conversation ID since we couldn't fetch this conversation
-          sessionStorage.removeItem('shopAiConversationId');
-        }
+      } catch (_) {
+        this.removeTypingIndicator();
       }
     },
 
-    /**
-     * Authentication-related functionality
-     */
-    Auth: {
-      /**
-       * Opens an authentication popup window
-       * @param {string|HTMLElement} authUrlOrElement - The auth URL or link element that was clicked
-       */
-      openAuthPopup: function(authUrlOrElement) {
-        let authUrl;
-        if (typeof authUrlOrElement === 'string') {
-          // If a string URL was passed directly
-          authUrl = authUrlOrElement;
-        } else {
-          // If an element was passed
-          authUrl = authUrlOrElement.getAttribute('data-auth-url');
-          if (!authUrl) {
-            console.error('No auth URL found in element');
-            return;
-          }
-        }
-
-        // Open the popup window centered in the screen
-        const width = 600;
-        const height = 700;
-        const left = (window.innerWidth - width) / 2 + window.screenX;
-        const top = (window.innerHeight - height) / 2 + window.screenY;
-
-        const popup = window.open(
-          authUrl,
-          'ShopifyAuth',
-          `width=${width},height=${height},left=${left},top=${top},resizable=yes,scrollbars=yes`
-        );
-
-        // Focus the popup window
-        if (popup) {
-          popup.focus();
-        } else {
-          // If popup was blocked, show a message
-          alert('Please allow popups for this site to authenticate with Shopify.');
-        }
-
-        // Start polling for token availability
-        const conversationId = sessionStorage.getItem('shopAiConversationId');
-        if (conversationId) {
-          const messagesContainer = document.querySelector('.shop-ai-chat-messages');
-
-          // Add a message to indicate authentication is in progress
-          ShopAIChat.Message.add("Authentication in progress. Please complete the process in the popup window.",
-            'assistant', messagesContainer);
-
-          this.startTokenPolling(conversationId, messagesContainer);
-        }
-      },
-
-      /**
-       * Start polling for token availability
-       * @param {string} conversationId - Conversation ID
-       * @param {HTMLElement} messagesContainer - The messages container
-       */
-      startTokenPolling: function(conversationId, messagesContainer) {
-        if (!conversationId) return;
-
-        console.log('Starting token polling for conversation:', conversationId);
-        const pollingId = 'polling_' + Date.now();
-        sessionStorage.setItem('shopAiTokenPollingId', pollingId);
-
-        let attemptCount = 0;
-        const maxAttempts = 30;
-
-        const poll = async () => {
-          if (sessionStorage.getItem('shopAiTokenPollingId') !== pollingId) {
-            console.log('Another polling session has started, stopping this one');
-            return;
-          }
-
-          if (attemptCount >= maxAttempts) {
-            console.log('Max polling attempts reached, stopping');
-            return;
-          }
-
-          attemptCount++;
-
-          try {
-            const tokenUrl = 'https://localhost:3458/auth/token-status?conversation_id=' +
-              encodeURIComponent(conversationId);
-            const response = await fetch(tokenUrl);
-
-            if (!response.ok) {
-              throw new Error('Token status check failed: ' + response.status);
-            }
-
-            const data = await response.json();
-
-            if (data.status === 'authorized') {
-              console.log('Token available, resuming conversation');
-              const message = sessionStorage.getItem('shopAiLastMessage');
-
-              if (message) {
-                sessionStorage.removeItem('shopAiLastMessage');
-                setTimeout(() => {
-                  ShopAIChat.Message.add("Authorization successful! I'm now continuing with your request.",
-                    'assistant', messagesContainer);
-                  ShopAIChat.API.streamResponse(message, conversationId, messagesContainer);
-                  ShopAIChat.UI.showTypingIndicator();
-                }, 500);
-              }
-
-              sessionStorage.removeItem('shopAiTokenPollingId');
-              return;
-            }
-
-            console.log('Token not available yet, polling again in 10s');
-            setTimeout(poll, 10000);
-          } catch (error) {
-            console.error('Error polling for token status:', error);
-            setTimeout(poll, 10000);
-          }
-        };
-
-        setTimeout(poll, 2000);
-      }
+    appendUserMessage: function(text) {
+      const container = this.elements.messagesContainer;
+      const el = document.createElement('div');
+      el.className = 'shop-ai-message user';
+      el.textContent = text;
+      container.appendChild(el);
     },
 
-    /**
-     * Facetimefy Attribution Management for Native Shopify Order Tagging
-     */
-    Attribution: {
-      tagUrl: function(url) {
-        if (!url) return url;
-        try {
-          const parsed = new URL(url, window.location.origin);
-          parsed.searchParams.set('utm_source', 'facetimefy');
-          parsed.searchParams.set('utm_medium', 'concierge');
-          parsed.searchParams.set('utm_campaign', 'chat_assistant');
-          return parsed.toString();
-        } catch (_) {
-          const sep = url.includes('?') ? '&' : '?';
-          return `${url}${sep}utm_source=facetimefy&utm_medium=concierge&utm_campaign=chat_assistant`;
+    showTypingIndicator: function() {
+      this.removeTypingIndicator();
+      const container = this.elements.messagesContainer;
+      const ind = document.createElement('div');
+      ind.className = 'shop-ai-typing-indicator';
+      ind.id = 'shop-ai-typing';
+      ind.innerHTML = '<span></span><span></span><span></span>';
+      container.appendChild(ind);
+      this.scrollToBottom();
+    },
+
+    removeTypingIndicator: function() {
+      const ind = document.getElementById('shop-ai-typing');
+      if (ind) ind.remove();
+    },
+
+    /* ==========================================================================
+       6. LIVECOMMERCE INGEST & DISPLAY (Exact Screenshots 2, 3, 4 Parity)
+       ========================================================================== */
+
+    ingest: function(raw, hint) {
+      this.state.lastRaw = raw;
+
+      // Extract products from any raw markdown tables and strip table syntax from text
+      let rawMsg = (raw && typeof raw === 'object' ? raw.message : typeof raw === 'string' ? raw : '') || '';
+      const extracted = extractProductsFromMarkdown(rawMsg);
+      const displayMessage = extracted.cleanedText;
+
+      const routed = routeResult(raw, hint);
+
+      // Supply or merge extracted products so visual cards always render
+      if (extracted.products.length > 0) {
+        if (!routed.products || routed.products.length === 0) {
+          routed.products = extracted.products;
+          if (routed.view === 'unknown' || routed.view === 'message') {
+            routed.view = 'discovery';
+          }
+        } else {
+          const existingIds = new Set(routed.products.map(p => p.id || p.title));
+          for (const ep of extracted.products) {
+            if (!existingIds.has(ep.id || ep.title)) {
+              routed.products.push(ep);
+            }
+          }
         }
-      },
-      stampSession: function() {
+      }
+
+      const container = this.elements.messagesContainer;
+      const assistantMsg = document.createElement('div');
+      assistantMsg.className = 'shop-ai-message assistant';
+
+      // 1. If products returned (In-stream LiveCommerce Carousel & Cards)
+      if (routed.products && routed.products.length > 0) {
+        const prodSec = this.createLiveCommerceShelf(routed.products, displayMessage || rawMsg, assistantMsg);
+        assistantMsg.appendChild(prodSec);
+      }
+
+      // 2. Assistant summary / explanation text (Cleaned text without the table!)
+      if (displayMessage) {
+        const textWrap = document.createElement('div');
+        textWrap.className = 'shop-ai-message-text';
+        textWrap.innerHTML = this.formatMarkdown(displayMessage);
+        assistantMsg.appendChild(textWrap);
+      }
+
+      // 3. Quick action suggestion chips (Screenshots 3 & 4)
+      const chips = this.extractSuggestionChips(raw);
+      if (chips.length > 0) {
+        const chipsWrap = document.createElement('div');
+        chipsWrap.className = 'shop-ai-suggestion-chips';
+        chips.forEach(chipText => {
+          const chip = document.createElement('button');
+          chip.type = 'button';
+          chip.className = 'shop-ai-chip';
+          chip.textContent = chipText;
+          chip.addEventListener('click', () => {
+            this.trackAnalytics('AgentResponseClick', { prompt: chipText });
+            if (/checkout/i.test(chipText)) {
+              this.handleCheckoutFlow();
+            } else {
+              this.sendUserMessage(chipText);
+            }
+          });
+          chipsWrap.appendChild(chip);
+        });
+        assistantMsg.appendChild(chipsWrap);
+      }
+
+      // 4. Message Action Icons (Screenshot 4: Copy, Thumbs Up, Thumbs Down)
+      const actionsWrap = document.createElement('div');
+      actionsWrap.className = 'shop-ai-message-actions';
+
+      // Copy Button
+      const copyBtn = document.createElement('button');
+      copyBtn.type = 'button';
+      copyBtn.className = 'shop-ai-action-btn';
+      copyBtn.title = 'Copy response';
+      copyBtn.innerHTML = `
+        <svg viewBox="0 0 24 24" width="13" height="13" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+          <rect x="9" y="9" width="13" height="13" rx="2" ry="2"/>
+          <path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"/>
+        </svg>
+      `;
+      copyBtn.addEventListener('click', () => {
+        const textToCopy = raw.message || assistantMsg.innerText;
+        navigator.clipboard?.writeText(textToCopy).then(() => {
+          copyBtn.classList.add('active');
+          setTimeout(() => copyBtn.classList.remove('active'), 1500);
+        });
+      });
+      actionsWrap.appendChild(copyBtn);
+
+      // Thumbs Up
+      const thumbUpBtn = document.createElement('button');
+      thumbUpBtn.type = 'button';
+      thumbUpBtn.className = 'shop-ai-action-btn';
+      thumbUpBtn.title = 'Helpful';
+      thumbUpBtn.innerHTML = `
+        <svg viewBox="0 0 24 24" width="13" height="13" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+          <path d="M14 9V5a3 3 0 0 0-3-3l-4 9v11h11.28a2 2 0 0 0 2-1.7l1.38-9a2 2 0 0 0-2-2.3zM7 22H4a2 2 0 0 1-2-2v-7a2 2 0 0 1 2-2h3"/>
+        </svg>
+      `;
+      thumbUpBtn.addEventListener('click', () => {
+        thumbUpBtn.classList.toggle('active');
+        this.trackAnalytics('AgentFeedback', { value: 'thumb_up' });
+      });
+      actionsWrap.appendChild(thumbUpBtn);
+
+      // Thumbs Down
+      const thumbDownBtn = document.createElement('button');
+      thumbDownBtn.type = 'button';
+      thumbDownBtn.className = 'shop-ai-action-btn';
+      thumbDownBtn.title = 'Not helpful';
+      thumbDownBtn.innerHTML = `
+        <svg viewBox="0 0 24 24" width="13" height="13" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+          <path d="M10 15v4a3 3 0 0 0 3 3l4-9V2H5.72a2 2 0 0 0-2 1.7l-1.38 9a2 2 0 0 0 2 2.3zm7-13h3a2 2 0 0 1 2 2v7a2 2 0 0 1-2 2h-3"/>
+        </svg>
+      `;
+      thumbDownBtn.addEventListener('click', () => {
+        thumbDownBtn.classList.toggle('active');
+        this.trackAnalytics('AgentFeedback', { value: 'thumb_down' });
+      });
+      actionsWrap.appendChild(thumbDownBtn);
+
+      assistantMsg.appendChild(actionsWrap);
+
+      container.appendChild(assistantMsg);
+      this.scrollToBottom();
+      return routed;
+    },
+
+    createLiveCommerceShelf: function(products, queryHint, assistantMsg) {
+      const shelf = document.createElement('div');
+      shelf.className = 'shop-ai-lc-shelf';
+
+      // Header row with pulsating indicator
+      const header = document.createElement('div');
+      header.className = 'shop-ai-lc-header';
+
+      let topic = 'RESULTS';
+      if (queryHint) {
+        const boldMatch = queryHint.match(/\*\*([^*]+)\*\*/);
+        if (boldMatch) topic = boldMatch[1].toUpperCase();
+      }
+
+      header.innerHTML = `
+        <span class="shop-ai-lc-header-title">
+          <i class="shop-ai-lc-dot"></i>
+          <span>${topic}</span>
+        </span>
+        <span class="shop-ai-lc-count">${products.length} ${products.length === 1 ? 'item' : 'items'}</span>
+      `;
+      shelf.appendChild(header);
+
+      // Horizontal snap carousel
+      const carousel = document.createElement('div');
+      carousel.className = 'shop-ai-lc-carousel lc-no-sb';
+
+      products.forEach(product => {
+        carousel.appendChild(this.createLiveCommerceCard(product, assistantMsg));
+      });
+
+      shelf.appendChild(carousel);
+      return shelf;
+    },
+
+    createLiveCommerceCard: function(product, assistantMsg) {
+      const card = document.createElement('div');
+      card.className = 'shop-ai-lc-card';
+
+      // Badge if present
+      if (product.badge) {
+        const badge = document.createElement('span');
+        badge.className = 'shop-ai-lc-badge';
+        badge.textContent = product.badge;
+        card.appendChild(badge);
+      }
+
+      // Thumbnail
+      const thumb = document.createElement('div');
+      thumb.className = 'shop-ai-lc-thumb';
+      const imgSrc = product.media && product.media[0] ? product.media[0] : null;
+      if (imgSrc) {
+        const img = document.createElement('img');
+        img.src = imgSrc;
+        img.alt = product.title || '';
+        img.loading = 'lazy';
+        thumb.appendChild(img);
+      } else {
+        const initials = (product.title || 'Store')
+          .split(/\s+/)
+          .slice(0, 2)
+          .map(w => w[0] || '')
+          .join('')
+          .toUpperCase() || '•';
+        thumb.textContent = initials;
+      }
+      card.appendChild(thumb);
+
+      // Title
+      const title = document.createElement('div');
+      title.className = 'shop-ai-lc-title';
+      title.textContent = product.title || 'Product';
+      card.appendChild(title);
+
+      // Seller / Brand
+      const seller = document.createElement('div');
+      seller.className = 'shop-ai-lc-seller';
+      seller.textContent = product.seller || window.shopInitialData?.shopName || '';
+      card.appendChild(seller);
+
+      // Star rating if present
+      if (product.rating != null) {
+        const starsWrap = document.createElement('div');
+        starsWrap.className = 'shop-ai-lc-stars';
+        const ratingPct = Math.min(100, Math.max(0, (product.rating / 5) * 100));
+        starsWrap.innerHTML = `
+          <span class="stars-bg">★★★★★<span class="stars-fill" style="width: ${ratingPct}%">★★★★★</span></span>
+          ${product.reviews != null ? `<span class="reviews-count">(${product.reviews})</span>` : ''}
+        `;
+        card.appendChild(starsWrap);
+      }
+
+      // Price Row
+      const priceRow = document.createElement('div');
+      priceRow.className = 'shop-ai-lc-price-row';
+      const currentPrice = document.createElement('span');
+      currentPrice.className = 'shop-ai-lc-price';
+      currentPrice.textContent = product.priceLabel || '—';
+      priceRow.appendChild(currentPrice);
+
+      if (product.compareLabel) {
+        const compare = document.createElement('s');
+        compare.className = 'shop-ai-lc-compare';
+        compare.textContent = product.compareLabel;
+        priceRow.appendChild(compare);
+      }
+      card.appendChild(priceRow);
+
+      // "+ Add to bag" Button
+      const addBtn = document.createElement('button');
+      addBtn.type = 'button';
+      addBtn.className = 'shop-ai-lc-btn-add';
+      addBtn.innerHTML = `
+        <svg viewBox="0 0 24 24" width="12" height="12" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round">
+          <line x1="12" y1="5" x2="12" y2="19"/>
+          <line x1="5" y1="12" x2="19" y2="12"/>
+        </svg>
+        <span>Add to bag</span>
+      `;
+
+      addBtn.addEventListener('click', async (e) => {
+        e.stopPropagation();
+        addBtn.disabled = true;
+        addBtn.querySelector('span').textContent = 'Adding…';
+
+        await this.resolveShopifyProductDetails(product);
+
+        // If product has options or multiple variants, render in-stream variant picker
+        if (product.variants.length > 1 || (product.options && product.options.length > 0)) {
+          addBtn.disabled = false;
+          addBtn.querySelector('span').textContent = 'Add to bag';
+          this.renderInStreamVariantPicker(product, assistantMsg);
+          return;
+        }
+
+        // Single variant: directly add to native cart
+        const variantId = product.variants[0]?.id || product.id;
+        const success = await this.addVariantToCart(variantId, product.title, product.priceLabel);
+        if (success) {
+          addBtn.querySelector('span').textContent = '✓ Added';
+          setTimeout(() => {
+            addBtn.disabled = false;
+            addBtn.querySelector('span').textContent = 'Add to bag';
+          }, 2000);
+          this.renderInStreamCartConfirm(product, product.variants[0] || null, assistantMsg);
+        } else {
+          addBtn.disabled = false;
+          addBtn.querySelector('span').textContent = 'Add to bag';
+        }
+      });
+
+      card.appendChild(addBtn);
+
+      // Clicking card also allows viewing/selecting options
+      card.addEventListener('click', async () => {
+        this.trackAnalytics('AgentProductClick', {
+          product_id: product.id || '',
+          product_title: product.title || '',
+          price: product.price || 0
+        });
+        await this.resolveShopifyProductDetails(product);
+        if (product.variants.length > 1 || (product.options && product.options.length > 0)) {
+          this.renderInStreamVariantPicker(product, assistantMsg);
+        }
+      });
+
+      return card;
+    },
+
+    renderInStreamVariantPicker: function(product, assistantMsg) {
+      // Remove any previously open picker in this message
+      const existing = assistantMsg.querySelector('.shop-ai-lc-variant-card');
+      if (existing) existing.remove();
+
+      const picker = document.createElement('div');
+      picker.className = 'shop-ai-lc-variant-card';
+
+      // Header with product details
+      const header = document.createElement('div');
+      header.className = 'shop-ai-lc-variant-header';
+      const thumbSrc = product.media && product.media[0] ? product.media[0] : '';
+      header.innerHTML = `
+        ${thumbSrc ? `<img src="${thumbSrc}" class="shop-ai-lc-variant-thumb" alt="${product.title || ''}">` : ''}
+        <div class="shop-ai-lc-variant-info">
+          <div class="shop-ai-lc-variant-title">${product.title || ''}</div>
+          <div class="shop-ai-lc-variant-price" id="shop-ai-picker-price">${product.priceLabel || '—'}</div>
+        </div>
+        <button type="button" class="shop-ai-header-btn" style="width:24px;height:24px;font-size:12px;" aria-label="Close">✕</button>
+      `;
+      header.querySelector('button').addEventListener('click', () => picker.remove());
+      picker.appendChild(header);
+
+      let selectedOptions = {};
+      if (product.variants.length > 0) {
+        selectedOptions = { ...product.variants[0].options };
+      }
+
+      const updateSelectedPrice = () => {
+        const keys = Object.keys(selectedOptions);
+        if (keys.length > 0 && product.variants.length > 0) {
+          const matched = product.variants.find(v => keys.every(k => v.options[k] === selectedOptions[k]));
+          if (matched && matched.priceLabel) {
+            const priceEl = picker.querySelector('#shop-ai-picker-price');
+            if (priceEl) priceEl.textContent = matched.priceLabel;
+          }
+        }
+      };
+
+      // Option groups (e.g. Size, Scent, Color)
+      if (product.options && product.options.length > 0) {
+        product.options.forEach(opt => {
+          const grp = document.createElement('div');
+          grp.className = 'shop-ai-lc-options-group';
+
+          const lbl = document.createElement('div');
+          lbl.className = 'shop-ai-lc-opt-label';
+          lbl.textContent = opt.label;
+          grp.appendChild(lbl);
+
+          const chipsWrap = document.createElement('div');
+          chipsWrap.className = 'shop-ai-lc-opt-chips';
+
+          opt.values.forEach(val => {
+            const chip = document.createElement('button');
+            chip.type = 'button';
+            chip.className = `shop-ai-lc-opt-chip ${selectedOptions[opt.label] === val.label ? 'active' : ''}`;
+            chip.textContent = val.label;
+            chip.addEventListener('click', () => {
+              selectedOptions[opt.label] = val.label;
+              chipsWrap.querySelectorAll('.shop-ai-lc-opt-chip').forEach(c => c.classList.remove('active'));
+              chip.classList.add('active');
+              updateSelectedPrice();
+            });
+            chipsWrap.appendChild(chip);
+          });
+
+          grp.appendChild(chipsWrap);
+          picker.appendChild(grp);
+        });
+      }
+
+      // Confirm button
+      const confirmBtn = document.createElement('button');
+      confirmBtn.type = 'button';
+      confirmBtn.className = 'shop-ai-lc-confirm-btn';
+      confirmBtn.innerHTML = `
+        <svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round">
+          <line x1="12" y1="5" x2="12" y2="19"/>
+          <line x1="5" y1="12" x2="19" y2="12"/>
+        </svg>
+        <span>Confirm & Add to bag</span>
+      `;
+
+      confirmBtn.addEventListener('click', async () => {
+        confirmBtn.disabled = true;
+        confirmBtn.querySelector('span').textContent = 'Adding…';
+
+        // Find matched variant
+        let chosenVariant = product.variants[0] || null;
+        const keys = Object.keys(selectedOptions);
+        if (keys.length > 0 && product.variants.length > 0) {
+          const found = product.variants.find(v => keys.every(k => v.options[k] === selectedOptions[k]));
+          if (found) chosenVariant = found;
+        }
+
+        const variantId = chosenVariant?.id || product.id;
+        const success = await this.addVariantToCart(variantId, product.title, chosenVariant?.priceLabel || product.priceLabel);
+
+        if (success) {
+          picker.remove();
+          this.renderInStreamCartConfirm(product, chosenVariant, assistantMsg);
+        } else {
+          confirmBtn.disabled = false;
+          confirmBtn.querySelector('span').textContent = 'Confirm & Add to bag';
+        }
+      });
+
+      picker.appendChild(confirmBtn);
+
+      // Insert directly below the shelf or text in assistantMsg
+      assistantMsg.appendChild(picker);
+      this.scrollToBottom();
+    },
+
+    renderInStreamCartConfirm: function(product, variant, assistantMsg) {
+      // Remove any prior confirmation cards
+      const existing = assistantMsg.querySelector('.shop-ai-lc-confirm-card');
+      if (existing) existing.remove();
+
+      const confirm = document.createElement('div');
+      confirm.className = 'shop-ai-lc-confirm-card';
+
+      const variantTitle = variant?.label || variant?.title || '';
+      const priceText = variant?.priceLabel || product.priceLabel || '';
+
+      confirm.innerHTML = `
+        <div class="shop-ai-lc-confirm-top">
+          <div class="shop-ai-lc-confirm-icon">
+            <svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="3" stroke-linecap="round" stroke-linejoin="round">
+              <polyline points="20 6 9 17 4 12"></polyline>
+            </svg>
+          </div>
+          <div class="shop-ai-lc-confirm-details">
+            <div class="shop-ai-lc-confirm-title">${product.title || 'Item added to bag'}</div>
+            <div class="shop-ai-lc-confirm-sub">${[variantTitle, priceText].filter(Boolean).join(' · ')}</div>
+          </div>
+          <button type="button" class="shop-ai-header-btn" style="width:24px;height:24px;font-size:12px;" aria-label="Dismiss">✕</button>
+        </div>
+        <div class="shop-ai-lc-confirm-actions">
+          <button type="button" class="shop-ai-lc-btn-browse">Continue browsing</button>
+          <button type="button" class="shop-ai-lc-btn-checkout">Checkout →</button>
+        </div>
+      `;
+
+      confirm.querySelector('.shop-ai-header-btn').addEventListener('click', () => confirm.remove());
+      confirm.querySelector('.shop-ai-lc-btn-browse').addEventListener('click', () => confirm.remove());
+      confirm.querySelector('.shop-ai-lc-btn-checkout').addEventListener('click', () => {
+        this.redirectToCheckout();
+      });
+
+      assistantMsg.appendChild(confirm);
+      this.scrollToBottom();
+    },
+
+    resolveShopifyProductDetails: async function(product) {
+      if (!product) return product;
+      if (product.variants && product.variants.length > 0 && /^\d+$/.test(String(product.variants[0].id).replace(/\D/g, ''))) {
+        return product;
+      }
+      let handle = product.handle;
+      if (!handle && product.url) {
+        const m = product.url.match(/\/products\/([a-zA-Z0-9_-]+)/);
+        if (m) handle = m[1];
+      }
+      if (!handle && typeof product.id === 'string' && !/^\d+$/.test(product.id)) {
+        handle = product.id.replace(/^gid:\/\/shopify\/Product\//, '');
+      }
+      if (handle) {
         try {
-          if (typeof window !== 'undefined' && window.history && window.history.replaceState) {
-            const url = new URL(window.location.href);
-            if (!url.searchParams.has('utm_source')) {
-              url.searchParams.set('utm_source', 'facetimefy');
-              url.searchParams.set('utm_medium', 'concierge');
-              window.history.replaceState(null, '', url.toString());
+          const res = await fetch(`/products/${handle}.js`, { headers: { 'Accept': 'application/json' } });
+          if (res.ok) {
+            const data = await res.json();
+            if (data.variants && data.variants.length > 0) {
+              product.variants = data.variants.map(v => ({
+                id: String(v.id),
+                label: v.title !== 'Default Title' ? v.title : product.title,
+                priceLabel: money(v.price / 100, { currency: window.shopInitialData?.currency || 'USD' }),
+                options: v.options,
+                available: v.available,
+                raw: v
+              }));
+              if (data.images && data.images.length > 0 && (!product.media || product.media.length === 0)) {
+                product.media = data.images;
+              }
+              if (data.options && data.options.length > 0 && data.options[0].name !== 'Title') {
+                product.options = data.options.map(opt => ({
+                  id: opt.name.toLowerCase().replace(/[^a-z0-9]/g, ''),
+                  label: opt.name,
+                  values: (opt.values || []).map(v => ({ label: v }))
+                }));
+              }
             }
           }
         } catch (_) {}
       }
+      return product;
     },
 
-    /**
-     * Product-related functionality
-     */
-    Product: {
-      /**
-       * Create a product card element
-       * @param {Object} product - Product data
-       * @returns {HTMLElement} Product card element
-       */
-      createCard: function(product) {
-        const card = document.createElement('div');
-        card.classList.add('shop-ai-product-card');
+    createProductCard: function(product) {
+      const card = document.createElement('div');
+      card.className = 'shop-ai-product-card';
 
-        // Create image container
-        const imageContainer = document.createElement('div');
-        imageContainer.classList.add('shop-ai-product-image');
+      const topRow = document.createElement('div');
+      topRow.className = 'shop-ai-product-top-row';
 
-        // Add product image or placeholder
-        const image = document.createElement('img');
-        image.src = product.image_url || 'https://cdn.shopify.com/s/files/1/0533/2089/files/placeholder-images-image_large.png';
-        image.alt = product.title;
-        image.style.cursor = 'pointer';
-        image.onerror = function() {
-          // If image fails to load, use a fallback placeholder
-          this.src = 'https://cdn.shopify.com/s/files/1/0533/2089/files/placeholder-images-image_large.png';
-        };
-        image.addEventListener('click', function() {
-          if (product.url) {
-            window.open(ShopAIChat.Attribution.tagUrl(product.url), '_blank');
-          }
-        });
-        imageContainer.appendChild(image);
-        card.appendChild(imageContainer);
+      // Thumbnail
+      const thumb = document.createElement('div');
+      thumb.className = 'shop-ai-product-thumbnail';
+      const imgSrc = product.media[0] || 'https://cdn.shopify.com/s/files/1/0533/2089/files/placeholder-images-image_large.png';
+      const img = document.createElement('img');
+      img.src = imgSrc;
+      img.alt = product.title;
+      img.loading = 'lazy';
+      thumb.appendChild(img);
+      thumb.addEventListener('click', async () => {
+        await this.resolveShopifyProductDetails(product);
+        this.openDetailSheet(product);
+      });
+      topRow.appendChild(thumb);
 
-        // Add product info
-        const info = document.createElement('div');
-        info.classList.add('shop-ai-product-info');
+      // Meta
+      const meta = document.createElement('div');
+      meta.className = 'shop-ai-product-meta';
 
-        // Add product title
-        const title = document.createElement('h3');
-        title.classList.add('shop-ai-product-title');
-        title.textContent = product.title;
+      const titleLink = document.createElement('a');
+      titleLink.className = 'shop-ai-product-title-link';
+      titleLink.textContent = product.title;
+      titleLink.href = product.url || '#';
+      titleLink.addEventListener('click', async (e) => {
+        if (!product.url) {
+          e.preventDefault();
+          await this.resolveShopifyProductDetails(product);
+          this.openDetailSheet(product);
+        }
+      });
+      meta.appendChild(titleLink);
 
-        // If product has a URL, make the title a link with Facetimefy UTM attribution
-        if (product.url) {
-          const titleLink = document.createElement('a');
-          titleLink.href = ShopAIChat.Attribution.tagUrl(product.url);
-          titleLink.target = '_blank';
-          titleLink.textContent = product.title;
-          title.textContent = '';
-          title.appendChild(titleLink);
+      const price = document.createElement('div');
+      price.className = 'shop-ai-product-price';
+      price.textContent = product.priceLabel || '—';
+      meta.appendChild(price);
+
+      // Add to Cart Button (White pill button "+ Add to cart")
+      const addBtn = document.createElement('button');
+      addBtn.type = 'button';
+      addBtn.className = 'shop-ai-product-add-btn';
+      addBtn.innerHTML = `
+        <svg viewBox="0 0 24 24" width="13" height="13" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round">
+          <line x1="12" y1="5" x2="12" y2="19"/>
+          <line x1="5" y1="12" x2="19" y2="12"/>
+        </svg>
+        <span>Add to cart</span>
+      `;
+
+      addBtn.addEventListener('click', async () => {
+        addBtn.disabled = true;
+        addBtn.querySelector('span').textContent = 'Adding…';
+
+        await this.resolveShopifyProductDetails(product);
+
+        // If product has multiple variants or options, open detail sheet to let user choose
+        if (product.variants.length > 1 || (product.options && product.options.length > 0)) {
+          addBtn.disabled = false;
+          addBtn.querySelector('span').textContent = 'Add to cart';
+          this.openDetailSheet(product);
+          return;
         }
 
+        const variantId = product.variants[0]?.id || product.id;
+        const success = await this.addVariantToCart(variantId, product.title, product.priceLabel);
+        if (success) {
+          addBtn.querySelector('span').textContent = '✓ Added';
+          setTimeout(() => {
+            addBtn.disabled = false;
+            addBtn.querySelector('span').textContent = 'Add to cart';
+          }, 2500);
+        } else {
+          addBtn.disabled = false;
+          addBtn.querySelector('span').textContent = 'Add to cart';
+        }
+      });
+
+      meta.appendChild(addBtn);
+      topRow.appendChild(meta);
+      card.appendChild(topRow);
+
+      // Description
+      if (product.description) {
+        const desc = document.createElement('p');
+        desc.className = 'shop-ai-product-description';
+        desc.textContent = product.description;
+        card.appendChild(desc);
+      }
+
+      return card;
+    },
+
+    extractSuggestionChips: function(raw) {
+      const chips = [];
+      const msg = raw.message || '';
+
+      // Pattern 1: Follow-up suggestions from message text
+      if (/checkout/i.test(msg) || raw.cart) {
+        chips.push('Checkout');
+      }
+
+      // Check collections or related categories for contextual suggestions
+      const collections = window.shopInitialData?.collections || [];
+      if (collections.length > 0) {
+        if (/numbing/i.test(msg)) {
+          chips.push('Shop numbing creams', 'Explore aftercare balms', 'See tattoo gel sets');
+        } else if (/machine/i.test(msg)) {
+          chips.push('Tattoo Machines', 'Power Supplies', 'Shop Needles');
+        } else {
+          collections.slice(0, 3).forEach(c => chips.push(`Shop ${c.title}`));
+        }
+      }
+
+      return [...new Set(chips)].slice(0, 4);
+    },
+
+    handleCheckoutFlow: function() {
+      // User says checkout (Screenshot 4)
+      this.appendUserMessage('Checkout');
+      this.scrollToBottom();
+
+      const container = this.elements.messagesContainer;
+      const botMsg = document.createElement('div');
+      botMsg.className = 'shop-ai-message assistant';
+
+      const statusNote = document.createElement('div');
+      statusNote.className = 'shop-ai-status-note';
+      statusNote.innerHTML = '<span class="shop-ai-status-note-dot"></span> Redirecting to checkout…';
+      botMsg.appendChild(statusNote);
+
+      container.appendChild(botMsg);
+      this.scrollToBottom();
+
+      setTimeout(() => {
+        this.redirectToCheckout();
+      }, 800);
+    },
+
+    /* ==========================================================================
+       7. PRODUCT DETAIL & OPTIONS SHEET (LiveCommerce layer)
+       ========================================================================== */
+
+    openDetailSheet: function(product) {
+      this.trackAnalytics('AgentProductClick', {
+        product_id: product.id || '',
+        product_title: product.title || '',
+        price: product.price || 0
+      });
+      this.state.activeProduct = product;
+      this.state.selectedOptions = {};
+
+      // Pre-select first variant options if available
+      if (product.variants.length > 0) {
+        this.state.selectedOptions = { ...product.variants[0].options };
+      }
+
+      const { detailSheet, detailSheetSeller, detailSheetPrice, detailSheetBody } = this.elements;
+      detailSheetSeller.textContent = product.seller || '';
+      detailSheetPrice.textContent = product.priceLabel || '—';
+
+      detailSheetBody.innerHTML = '';
+
+      // Media
+      if (product.media.length > 0) {
+        const mediaWrap = document.createElement('div');
+        mediaWrap.className = 'shop-ai-sheet-media';
+        const img = document.createElement('img');
+        img.src = product.media[0];
+        img.alt = product.title;
+        mediaWrap.appendChild(img);
+        detailSheetBody.appendChild(mediaWrap);
+      }
+
+      // Title
+      const title = document.createElement('h3');
+      title.className = 'shop-ai-sheet-product-title';
+      title.textContent = product.title;
+      detailSheetBody.appendChild(title);
+
+      // Options
+      if (product.options.length > 0) {
+        product.options.forEach(opt => {
+          const group = document.createElement('div');
+          group.className = 'shop-ai-option-group';
+
+          const label = document.createElement('div');
+          label.className = 'shop-ai-option-label';
+          label.textContent = opt.label;
+          group.appendChild(label);
+
+          const valsWrap = document.createElement('div');
+          valsWrap.className = 'shop-ai-option-values';
+
+          opt.values.forEach(val => {
+            const chip = document.createElement('button');
+            chip.type = 'button';
+            chip.className = `shop-ai-option-chip ${this.state.selectedOptions[opt.label] === val.label ? 'selected' : ''}`;
+            chip.textContent = val.label;
+            chip.addEventListener('click', () => {
+              this.state.selectedOptions[opt.label] = val.label;
+              valsWrap.querySelectorAll('.shop-ai-option-chip').forEach(c => c.classList.remove('selected'));
+              chip.classList.add('selected');
+
+              // Find matching variant
+              const matched = product.variants.find(v =>
+                Object.keys(this.state.selectedOptions).every(k => v.options[k] === this.state.selectedOptions[k])
+              );
+              if (matched && matched.priceLabel) {
+                detailSheetPrice.textContent = matched.priceLabel;
+              }
+            });
+            valsWrap.appendChild(chip);
+          });
+
+          group.appendChild(valsWrap);
+          detailSheetBody.appendChild(group);
+        });
+      }
+
+      // Description
+      if (product.description) {
+        const desc = document.createElement('p');
+        desc.className = 'shop-ai-product-description';
+        desc.style.webkitLineClamp = 'none';
+        desc.textContent = product.description;
+        detailSheetBody.appendChild(desc);
+      }
+
+      detailSheet.style.display = 'flex';
+    },
+
+    closeDetailSheet: function() {
+      this.elements.detailSheet.style.display = 'none';
+    },
+
+    onDetailAddClick: async function() {
+      const prod = this.state.activeProduct;
+      if (!prod) return;
+
+      const addBtn = this.elements.detailSheetAddBtn;
+      addBtn.disabled = true;
+      addBtn.querySelector('span').textContent = 'Adding…';
+
+      // Match variant
+      let variantId = prod.variants[0]?.id || prod.id;
+      if (prod.variants.length > 0) {
+        const matched = prod.variants.find(v =>
+          Object.keys(this.state.selectedOptions).every(k => v.options[k] === this.state.selectedOptions[k])
+        );
+        if (matched) variantId = matched.id;
+      }
+
+      const success = await this.addVariantToCart(variantId, prod.title, prod.priceLabel);
+      if (success) {
+        addBtn.querySelector('span').textContent = '✓ Added to bag';
+        setTimeout(() => {
+          this.closeDetailSheet();
+          addBtn.disabled = false;
+          addBtn.querySelector('span').textContent = 'Add to bag';
+        }, 800);
+      } else {
+        addBtn.disabled = false;
+        addBtn.querySelector('span').textContent = 'Add to bag';
+      }
+    },
+
+    /* ==========================================================================
+       8. CART REVIEW SHEET (LiveCommerce layer)
+       ========================================================================== */
+
+    openCartSheet: async function() {
+      await this.syncNativeCart();
+      this.renderCartSheetBody();
+      this.elements.cartSheet.style.display = 'flex';
+    },
+
+    closeCartSheet: function() {
+      this.elements.cartSheet.style.display = 'none';
+    },
+
+    renderCartSheetBody: function() {
+      const { cartSheetBody, cartSheetSubtotal } = this.elements;
+      cartSheetBody.innerHTML = '';
+
+      const cart = this.state.cart;
+      if (!cart || cart.lines.length === 0) {
+        cartSheetBody.innerHTML = '<div style="text-align: center; padding: 32px 0; color: #9ca3af; font-size: 13px;">Your shopping bag is empty.</div>';
+        cartSheetSubtotal.textContent = '$0.00';
+        return;
+      }
+
+      cart.lines.forEach(line => {
+        const row = document.createElement('div');
+        row.className = 'shop-ai-cart-line';
+
+        const thumb = document.createElement('div');
+        thumb.className = 'shop-ai-cart-line-thumb';
+        if (line.media) {
+          const img = document.createElement('img');
+          img.src = line.media;
+          img.alt = line.title;
+          thumb.appendChild(img);
+        }
+        row.appendChild(thumb);
+
+        const info = document.createElement('div');
+        info.className = 'shop-ai-cart-line-info';
+
+        const title = document.createElement('div');
+        title.className = 'shop-ai-cart-line-title';
+        title.textContent = line.title;
         info.appendChild(title);
 
-        // Add product price
-        const price = document.createElement('p');
-        price.classList.add('shop-ai-product-price');
-        price.textContent = product.price;
+        const price = document.createElement('div');
+        price.className = 'shop-ai-cart-line-price';
+        price.textContent = line.priceLabel || '—';
         info.appendChild(price);
 
-        // Add add-to-cart button
-        const button = document.createElement('button');
-        button.classList.add('shop-ai-add-to-cart');
-        button.textContent = 'Add to Cart';
-        button.dataset.productId = product.id || '';
-        const variantId = product.variant_id || product.selected_variant_id || product.id;
-        if (variantId) {
-          button.dataset.variantId = variantId;
-        }
+        row.appendChild(info);
 
-        // Direct native Shopify /cart/add.js with Facetimefy order attribution
-        button.addEventListener('click', async function() {
-          const targetVariantId = button.dataset.variantId;
-          const numPrice = parseFloat(String(product.price || '0').replace(/[^0-9.]/g, '')) || 0;
-          const conversationId = sessionStorage.getItem('shopAiConversationId') || '';
+        const qtyControls = document.createElement('div');
+        qtyControls.className = 'shop-ai-cart-line-qty';
 
-          if (targetVariantId) {
-            const cleanId = String(targetVariantId).includes('/') ? String(targetVariantId).split('/').pop() : targetVariantId;
-            button.textContent = 'Adding…';
-            button.disabled = true;
-            try {
-              // 1. Stamp browser URL so Shopify analytics registers Facetimefy UTM session
-              ShopAIChat.Attribution.stampSession();
-
-              // 2. Add item with Facetimefy properties
-              const res = await fetch('/cart/add.js', {
-                method: 'POST',
-                headers: { 'Content-Type': 'application/json', 'Accept': 'application/json' },
-                body: JSON.stringify({
-                  items: [{
-                    id: cleanId,
-                    quantity: 1,
-                    properties: {
-                      '_source': 'facetimefy',
-                      '_assisted_by': 'Facetimefy Concierge'
-                    }
-                  }]
-                })
-              });
-
-              if (res.ok) {
-                // 3. Update cart attributes for order-level attribution in Shopify Admin
-                try {
-                  await fetch('/cart/update.js', {
-                    method: 'POST',
-                    headers: { 'Content-Type': 'application/json', 'Accept': 'application/json' },
-                    body: JSON.stringify({
-                      attributes: {
-                        '_source': 'facetimefy',
-                        '_conversation_id': conversationId,
-                        'utm_source': 'facetimefy',
-                        'utm_medium': 'concierge'
-                      }
-                    })
-                  });
-                } catch (_) {}
-
-                button.textContent = '✓ Added';
-                window.dispatchEvent(new CustomEvent('cart:updated'));
-                ShopAIChat.Analytics.track('AgentAddToCartClick', {
-                  item: product.title || product.id || '',
-                  price: numPrice,
-                  quantity: 1,
-                  status: 'added_to_cart'
-                });
-              } else {
-                button.textContent = 'Add to Cart';
-                ShopAIChat.Analytics.track('AgentAddToCartClick', {
-                  item: product.title || product.id || '',
-                  price: numPrice,
-                  quantity: 1,
-                  status: `http_${res.status}`
-                });
-              }
-            } catch (e) {
-              button.textContent = 'Add to Cart';
-              ShopAIChat.Analytics.track('AgentAddToCartClick', {
-                item: product.title || product.id || '',
-                price: numPrice,
-                quantity: 1,
-                status: e.name || 'network_error'
-              });
-            } finally {
-              button.disabled = false;
-            }
-          }
+        const minus = document.createElement('button');
+        minus.type = 'button';
+        minus.className = 'shop-ai-qty-btn';
+        minus.textContent = '-';
+        minus.addEventListener('click', () => {
+          this.changeCartQuantity(line.id, Math.max(0, line.qty - 1));
         });
+        qtyControls.appendChild(minus);
 
-        info.appendChild(button);
-        card.appendChild(info);
+        const count = document.createElement('span');
+        count.style.fontSize = '12px';
+        count.style.fontWeight = '700';
+        count.style.minWidth = '16px';
+        count.style.textAlign = 'center';
+        count.textContent = line.qty;
+        qtyControls.appendChild(count);
 
-        return card;
-      }
+        const plus = document.createElement('button');
+        plus.type = 'button';
+        plus.className = 'shop-ai-qty-btn';
+        plus.textContent = '+';
+        plus.addEventListener('click', () => {
+          this.changeCartQuantity(line.id, line.qty + 1);
+        });
+        qtyControls.appendChild(plus);
+
+        row.appendChild(qtyControls);
+        cartSheetBody.appendChild(row);
+      });
+
+      // Subtotal display
+      const totalObj = cart.totals.find(t => /total/i.test(t.label)) || cart.totals[0];
+      cartSheetSubtotal.textContent = totalObj ? totalObj.display : '$0.00';
     },
 
-    /**
-     * Storefront Telemetry for Cloudflare Analytics Engine
-     */
-    Analytics: {
-      track: function(eventType, metadata = {}) {
-        try {
-          const shopDomain = window.shopPermanentDomain || window.shopDomain || window.location.hostname;
-          const conversationId = sessionStorage.getItem('shopAiConversationId') || '';
-          const apiUrl = ShopAIChat.API.getApiUrl('/analytics/event');
+    /* ==========================================================================
+       9. LIVE VOICE DICTATION (Web Speech API)
+       ========================================================================== */
 
-          const payload = {
-            event_type: eventType,
-            store_domain: shopDomain,
-            page_url: window.location.pathname || '/',
-            conversation_id: conversationId,
-            ...metadata
-          };
+    initVoiceRecognition: function() {
+      const SpeechRecognition = window.SpeechRecognition || window.webkitSpeechRecognition;
+      if (!SpeechRecognition) {
+        if (this.elements.voiceStatus) this.elements.voiceStatus.textContent = 'Voice Unavailable';
+        return;
+      }
 
-          if (typeof fetch === 'function') {
-            fetch(apiUrl, {
-              method: 'POST',
-              headers: { 'Content-Type': 'application/json', 'Accept': 'application/json' },
-              body: JSON.stringify(payload),
-              keepalive: true
-            }).catch(() => {});
+      try {
+        const recognizer = new SpeechRecognition();
+        recognizer.continuous = false;
+        recognizer.interimResults = true;
+        recognizer.lang = navigator.language || 'en-US';
+
+        recognizer.onstart = () => {
+          this.state.isListening = true;
+          this.elements.dockMicBtn?.classList.add('listening');
+          if (this.elements.voiceStatus) this.elements.voiceStatus.textContent = 'Listening…';
+        };
+
+        recognizer.onresult = (event) => {
+          const transcript = Array.from(event.results)
+            .map(r => r[0].transcript)
+            .join('');
+          if (this.elements.inputField) {
+            this.elements.inputField.value = transcript;
           }
+        };
+
+        recognizer.onerror = () => {
+          this.stopVoiceDictation();
+        };
+
+        recognizer.onend = () => {
+          this.stopVoiceDictation();
+          // Auto-send if non-empty input
+          const val = this.elements.inputField?.value.trim();
+          if (val) {
+            this.toggleWindow(true);
+            this.sendUserMessage(val);
+            if (this.elements.inputField) this.elements.inputField.value = '';
+          }
+        };
+
+        this.state.speechRecognizer = recognizer;
+      } catch (_) {}
+    },
+
+    toggleVoiceDictation: function() {
+      if (!this.state.speechRecognizer) return;
+      if (this.state.isListening) {
+        this.state.speechRecognizer.stop();
+      } else {
+        try {
+          this.state.speechRecognizer.start();
         } catch (_) {}
       }
     },
 
-    /**
-     * Initialize the chat application
-     */
-    init: function() {
-      // Initialize UI
-      const container = document.querySelector('.shop-ai-chat-container');
-      if (!container) return;
+    stopVoiceDictation: function() {
+      this.state.isListening = false;
+      this.elements.dockMicBtn?.classList.remove('listening');
+      if (this.elements.voiceStatus) this.elements.voiceStatus.textContent = 'Voice Ready';
+    },
 
-      this.UI.init(container);
+    /* ==========================================================================
+       10. UTILITIES & TELEMETRY
+       ========================================================================== */
 
-      // Record bubble shown telemetry
-      this.Analytics.track('AgentBubbleShown');
+    formatMarkdown: function(text) {
+      if (!text) return '';
+      let out = text
+        .replace(/&/g, '&amp;')
+        .replace(/</g, '&lt;')
+        .replace(/>/g, '&gt;')
+        .replace(/\*\*([^*]+)\*\*/g, '<strong>$1</strong>')
+        .replace(/\*([^*]+)\*/g, '<em>$1</em>')
+        .replace(/\[([^\]]+)\]\(([^)]+)\)/g, '<a href="$2" target="_blank" rel="noopener noreferrer">$1</a>');
 
-      // Check for existing conversation
-      const conversationId = sessionStorage.getItem('shopAiConversationId');
+      return out.replace(/\n\n/g, '<br><br>').replace(/\n/g, '<br>');
+    },
 
-      if (conversationId) {
-        // Fetch conversation history
-        this.API.fetchChatHistory(conversationId, this.UI.elements.messagesContainer);
-      } else {
-        // No previous conversation, show welcome message
-        const welcomeMessage = window.shopChatConfig?.welcomeMessage || "👋 Hi there! How can I help you today?";
-        this.Message.add(welcomeMessage, 'assistant', this.UI.elements.messagesContainer);
+    trackAnalytics: function(eventType, metadata = {}) {
+      try {
+        if (typeof window.dispatchSmartEvent === 'function') {
+          window.dispatchSmartEvent(eventType, {
+            conversation_id: this.state.conversationId || '',
+            ...metadata
+          });
+          return;
+        }
+        const storeDomain = window.shopPermanentDomain || window.shopDomain || window.location.hostname;
+        const apiUrl = `${getBaseWorkerUrl()}/analytics/event`;
+
+        if (typeof fetch === 'function') {
+          fetch(apiUrl, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json', 'Accept': 'application/json' },
+            body: JSON.stringify({
+              event_type: eventType,
+              store_domain: storeDomain,
+              conversation_id: this.state.conversationId || '',
+              page_url: window.location.pathname || '/',
+              ...metadata
+            }),
+            keepalive: true
+          }).catch(() => {});
+        }
+      } catch (_) {}
+    },
+
+    fetchChatHistory: async function(conversationId) {
+      const apiUrl = `${getBaseWorkerUrl()}/chat?conversation_id=` + encodeURIComponent(conversationId);
+      try {
+        const res = await fetch(apiUrl, { headers: { 'Accept': 'application/json' } });
+        if (!res.ok) {
+          this.renderWelcomeScreen();
+          return;
+        }
+        const data = await res.json();
+        if (!data.messages || data.messages.length === 0) {
+          this.renderWelcomeScreen();
+          return;
+        }
+
+        this.elements.messagesContainer.innerHTML = '';
+        data.messages.forEach(m => {
+          if (m.role === 'user') {
+            this.appendUserMessage(m.content);
+          } else if (m.role === 'assistant') {
+            this.ingest({ message: m.content });
+          }
+        });
+        this.scrollToBottom();
+      } catch (_) {
+        this.renderWelcomeScreen();
       }
+    },
+
+    exposeGlobalBridge: function() {
+      const self = this;
+      window.LiveCommerce = {
+        ingest: (raw, hint) => self.ingest(raw, hint),
+        act: (intent) => {
+          if (intent.type === 'open_cart') self.openCartSheet();
+          if (intent.type === 'checkout') self.redirectToCheckout();
+        },
+        snapshot: () => ({
+          stage: self.state.stage,
+          conversationId: self.state.conversationId,
+          cart: self.state.cart,
+          activeProduct: self.state.activeProduct,
+          lastRaw: self.state.lastRaw
+        }),
+        reset: () => {
+          self.state.conversationId = null;
+          sessionStorage.removeItem('shopAiConversationId');
+          self.renderWelcomeScreen();
+        }
+      };
+      window.LiveCommerceState = window.LiveCommerce.snapshot();
     }
   };
 
-  // Initialize the application when DOM is ready
-  document.addEventListener('DOMContentLoaded', function() {
+  // DOM ready mount
+  if (document.readyState === 'loading') {
+    document.addEventListener('DOMContentLoaded', () => ShopAIChat.init());
+  } else {
     ShopAIChat.init();
-  });
+  }
 })();

@@ -1,26 +1,137 @@
 {{ 'chat.css' | asset_url | stylesheet_tag }}
 <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
+{% assign pos = block.settings.launcher_position | default: 'bottom-center' %}
+{% assign default_bot_name = shop.name | append: ' AI' %}
+{% if block.settings.agent_name != blank and block.settings.agent_name != 'Facetimefy AI' and block.settings.agent_name != 'Store AI' %}
+  {% assign bot_name = block.settings.agent_name %}
+{% else %}
+  {% assign bot_name = default_bot_name %}
+{% endif %}
 
-<div class="shop-ai-chat-container">
-  <div class="shop-ai-chat-bubble" style="background-color: {{ block.settings.chat_bubble_color }}">
-    <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" width="24" height="24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
-      <path d="M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z"/>
-    </svg>
+{% assign default_placeholder = 'Message ' | append: bot_name | append: '...' %}
+{% if block.settings.input_placeholder != blank and block.settings.input_placeholder != 'Message Store AI...' and block.settings.input_placeholder != 'Message Facetimefy AI...' %}
+  {% assign placeholder_text = block.settings.input_placeholder %}
+{% else %}
+  {% assign placeholder_text = default_placeholder %}
+{% endif %}
+
+<div class="shop-ai-chat-container pos-{{ pos }}" id="shop-ai-chat-root">
+  <!-- Shimmering Facetimefy Pill Launcher -->
+  <div class="shop-ai-pill-launcher" id="shop-ai-launcher" role="button" tabindex="0" aria-label="{{ block.settings.button_text | default: 'Shop with AI' }}">
+    <div class="shop-ai-pill-icon-wrap" style="background-color: {{ block.settings.icon_bg_color | default: '#ffffff' }};">
+      <svg class="shop-ai-sparkle-icon" style="color: {{ block.settings.icon_color | default: '#000000' }};" viewBox="0 0 24 24" fill="currentColor">
+        <path d="M12 2L14.4 9.6L22 12L14.4 14.4L12 22L9.6 14.4L2 12L9.6 9.6L12 2Z"/>
+        <path d="M5 2L6.2 5.8L10 7L6.2 8.2L5 12L3.8 8.2L0 7L3.8 5.8L5 2Z" opacity="0.6"/>
+      </svg>
+    </div>
+    <span class="shop-ai-pill-text">{{ block.settings.button_text | default: "Shop with AI" }}</span>
   </div>
 
-  <div class="shop-ai-chat-window">
+
+  <!-- Chat Window -->
+  <div class="shop-ai-chat-window" id="shop-ai-window" role="dialog" aria-label="Shopping Assistant Chat">
     <div class="shop-ai-chat-header">
-      <div>{{ 'chat.title' | t }}</div>
-      <button class="shop-ai-chat-close">✕</button>
+      <div class="shop-ai-header-left">
+        <div class="shop-ai-header-icon-wrap">
+          <svg viewBox="0 0 24 24" width="16" height="16" fill="currentColor">
+            <path d="M12 2L14.4 9.6L22 12L14.4 14.4L12 22L9.6 14.4L2 12L9.6 9.6L12 2Z"/>
+          </svg>
+        </div>
+        <span class="shop-ai-header-title">{{ bot_name }}</span>
+      </div>
+      <div class="shop-ai-header-actions">
+        <button type="button" class="shop-ai-header-btn shop-ai-cart-btn" id="shop-ai-header-cart" aria-label="View Shopping Cart" title="View Cart">
+          <svg viewBox="0 0 24 24" width="17" height="17" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+            <circle cx="9" cy="21" r="1"></circle>
+            <circle cx="20" cy="21" r="1"></circle>
+            <path d="M1 1h4l2.68 13.39a2 2 0 0 0 2 1.61h9.72a2 2 0 0 0 2-1.61L23 6H6"></path>
+          </svg>
+          <span class="shop-ai-cart-badge" id="shop-ai-cart-badge" style="display: none;">0</span>
+        </button>
+        <button type="button" class="shop-ai-header-btn shop-ai-dock-toggle" id="shop-ai-dock-toggle" aria-label="Toggle Window Size" title="Expand / Minimize">
+          <svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+            <rect x="3" y="3" width="18" height="18" rx="2" ry="2"/>
+            <line x1="9" y1="3" x2="9" y2="21"/>
+          </svg>
+        </button>
+        <button type="button" class="shop-ai-header-btn shop-ai-menu-btn" id="shop-ai-menu-btn" aria-label="Options" title="Options">
+          <svg viewBox="0 0 24 24" width="17" height="17" fill="currentColor">
+            <circle cx="12" cy="5" r="1.75"/>
+            <circle cx="12" cy="12" r="1.75"/>
+            <circle cx="12" cy="19" r="1.75"/>
+          </svg>
+        </button>
+        <button type="button" class="shop-ai-header-btn shop-ai-chat-close" id="shop-ai-chat-close" aria-label="Close chat" title="Close">✕</button>
+      </div>
     </div>
 
-    <div class="shop-ai-chat-messages">
-      <!-- Messages will be added here by JavaScript -->
+    <!-- Dropdown menu -->
+    <div class="shop-ai-dropdown-menu" id="shop-ai-dropdown-menu" style="display: none;">
+      <button type="button" class="shop-ai-menu-item" id="shop-ai-menu-clear">Clear conversation</button>
+      <a href="{{ routes.cart_url }}" class="shop-ai-menu-item">Open cart page</a>
+      <a href="{{ routes.account_url }}" class="shop-ai-menu-item">Track orders</a>
     </div>
 
+    <!-- Main Messages Scroll Area -->
+    <div class="shop-ai-chat-messages" id="shop-ai-messages">
+      <!-- Dynamic messages & product cards rendered by chat.js -->
+    </div>
+
+    <!-- Product Detail & Options Sheet (LiveCommerce layer) -->
+    <div class="shop-ai-sheet-overlay" id="shop-ai-detail-sheet" style="display: none;">
+      <div class="shop-ai-sheet-content">
+        <div class="shop-ai-sheet-header">
+          <button type="button" class="shop-ai-sheet-btn-back" id="shop-ai-sheet-close">✕</button>
+          <span class="shop-ai-sheet-seller" id="shop-ai-sheet-seller"></span>
+          <span class="shop-ai-sheet-spacer"></span>
+        </div>
+        <div class="shop-ai-sheet-body" id="shop-ai-sheet-body"></div>
+        <div class="shop-ai-sheet-footer">
+          <span class="shop-ai-sheet-price" id="shop-ai-sheet-price">$0.00</span>
+          <button type="button" class="shop-ai-sheet-add-btn" id="shop-ai-sheet-add-btn">
+            <svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round">
+              <circle cx="9" cy="21" r="1"></circle>
+              <circle cx="20" cy="21" r="1"></circle>
+              <path d="M1 1h4l2.68 13.39a2 2 0 0 0 2 1.61h9.72a2 2 0 0 0 2-1.61L23 6H6"></path>
+            </svg>
+            <span>Add to bag</span>
+          </button>
+        </div>
+      </div>
+    </div>
+
+    <!-- Full Cart Sheet (LiveCommerce layer) -->
+    <div class="shop-ai-sheet-overlay" id="shop-ai-cart-sheet" style="display: none;">
+      <div class="shop-ai-sheet-content">
+        <div class="shop-ai-sheet-header">
+          <span class="shop-ai-sheet-title" id="shop-ai-cart-sheet-title">YOUR BAG</span>
+          <button type="button" class="shop-ai-sheet-btn-back" id="shop-ai-cart-sheet-close">✕</button>
+        </div>
+        <div class="shop-ai-sheet-body" id="shop-ai-cart-sheet-body"></div>
+        <div class="shop-ai-sheet-footer shop-ai-cart-footer">
+          <div class="shop-ai-cart-subtotal-row">
+            <span>Estimated total</span>
+            <span class="shop-ai-cart-subtotal-amount" id="shop-ai-cart-subtotal">$0.00</span>
+          </div>
+          <button type="button" class="shop-ai-sheet-checkout-btn" id="shop-ai-cart-sheet-checkout">Proceed to Checkout</button>
+        </div>
+      </div>
+    </div>
+
+    <!-- Floating Bag Chip (shows inside chat when cart has items) -->
+    <button type="button" class="shop-ai-floating-bag" id="shop-ai-floating-bag" style="display: none;" aria-label="Open Cart Sheet">
+      <svg viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+        <circle cx="9" cy="21" r="1"></circle>
+        <circle cx="20" cy="21" r="1"></circle>
+        <path d="M1 1h4l2.68 13.39a2 2 0 0 0 2 1.61h9.72a2 2 0 0 0 2-1.61L23 6H6"></path>
+      </svg>
+      <span class="shop-ai-floating-bag-badge" id="shop-ai-floating-bag-badge">0</span>
+    </button>
+
+    <!-- Chat Input Area -->
     <div class="shop-ai-chat-input">
-      <input type="text" placeholder="{{ 'chat.inputPlaceholder' | t }}">
-      <button class="shop-ai-chat-send">
+      <input type="text" id="shop-ai-input-field" placeholder="{{ placeholder_text }}" autocomplete="off">
+      <button class="shop-ai-chat-send" id="shop-ai-send-btn" aria-label="Send message">
         <svg xmlns="http://www.w3.org/2000/svg" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
           <line x1="22" y1="2" x2="11" y2="13"></line>
           <polygon points="22 2 15 22 11 13 2 9 22 2"></polygon>
@@ -30,47 +141,112 @@
   </div>
 </div>
 
+<script src="{{ 'events.js' | asset_url }}" defer></script>
 <script src="{{ 'chat.js' | asset_url }}" defer></script>
 <script>
   window.shopChatConfig = {
     promptType: {{ block.settings.system_prompt | json }},
     welcomeMessage: {{ block.settings.welcome_message | json }},
-    apiUrl: {{ block.settings.api_url | default: "https://shop-chat-agent-worker.avi-kay2019.workers.dev" | json }}
+    apiUrl: {{ block.settings.api_url | default: "https://chat.facetimefy.com" | json }},
+    agentName: {{ bot_name | json }}
   };
   window.shopId = {{ shop.id }};
   window.shopPermanentDomain = {{ shop.permanent_domain | json }};
   window.shopDomain = {{ shop.domain | json }};
+  window.shopInitialData = {
+    shopName: {{ shop.name | json }},
+    currency: {{ cart.currency.iso_code | default: 'USD' | json }},
+    currencySymbol: {{ cart.currency.symbol | default: '$' | json }},
+    collections: [
+      {% for collection in collections limit: 12 %}
+        {% unless collection.handle == 'frontpage' %}
+        {
+          id: {{ collection.id | json }},
+          title: {{ collection.title | json }},
+          handle: {{ collection.handle | json }},
+          url: {{ collection.url | json }},
+          products_count: {{ collection.products_count | json }},
+          image: {% if collection.featured_image %}{{ collection.featured_image | image_url: width: 300 | json }}{% else %}null{% endif %}
+        }{% unless forloop.last %},{% endunless %}
+        {% endunless %}
+      {% endfor %}
+    ]
+  };
 </script>
 
 {% schema %}
 {
-  "name": "AI Chat Assistant",
+  "name": "Facetimefy AI Concierge",
   "target": "body",
   "settings": [
     {
+      "type": "text",
+      "id": "button_text",
+      "label": "Launcher Button Text",
+      "default": "Shop with AI"
+    },
+    {
+      "type": "select",
+      "id": "launcher_position",
+      "label": "Launcher Position",
+      "options": [
+        {
+          "value": "bottom-center",
+          "label": "Bottom Center (Recommended)"
+        },
+        {
+          "value": "bottom-right",
+          "label": "Bottom Right"
+        },
+        {
+          "value": "bottom-left",
+          "label": "Bottom Left"
+        }
+      ],
+      "default": "bottom-center"
+    },
+    {
       "type": "color",
-      "id": "chat_bubble_color",
-      "label": "Chat Bubble Color",
-      "default": "#5046e4"
+      "id": "icon_bg_color",
+      "label": "Icon Circle Background",
+      "default": "#ffffff"
+    },
+    {
+      "type": "color",
+      "id": "icon_color",
+      "label": "Sparkle Icon Color",
+      "default": "#000000"
+    },
+    {
+      "type": "text",
+      "id": "agent_name",
+      "label": "Agent Name",
+      "default": "Facetimefy AI"
     },
     {
       "type": "text",
       "id": "welcome_message",
       "label": "Welcome Message",
-      "default": "👋 Hi there! How can I help you today?"
+      "default": "👋 Ask me anything you are interested in."
+    },
+    {
+      "type": "text",
+      "id": "input_placeholder",
+      "label": "Input Placeholder",
+      "default": "Message Store AI..."
     },
     {
       "type": "select",
       "id": "system_prompt",
-      "label": "System Prompt",
+      "label": "System Prompt Style",
       "options": [
         {
           "value": "standardAssistant",
-          "label": "Standard Assistant"
+          "label": "Concierge Shopping Assistant"
         },
         {
           "value": "enthusiasticAssistant",
-          "label": "Enthusiastic Assistant"
+          "label": "Enthusiastic Stylist"
         }
       ],
       "default": "standardAssistant"
