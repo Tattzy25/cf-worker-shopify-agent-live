@@ -55,12 +55,6 @@ declare module './src/settings/SystemMessageSettings.jsx' {
 }
 
 //@ts-ignore
-declare module './src/settings/PowerMerchantSettings.jsx' {
-  const shopify: import('@shopify/ui-extensions/admin.app.home.render').Api;
-  const globalThis: { shopify: typeof shopify };
-}
-
-//@ts-ignore
 declare module './src/api/settingsApi.js' {
   const shopify: import('@shopify/ui-extensions/admin.app.home.render').Api;
   const globalThis: { shopify: typeof shopify };

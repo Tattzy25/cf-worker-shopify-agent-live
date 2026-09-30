@@ -8,8 +8,6 @@
  */
 import { recordAndAlertError, recordSystemError, dispatchAlertEmail, handleInboundEmail } from "./email.js";
 import { buildSystemPrompt, OPENAI_TOOLS, MASTER_MCP_URL } from "./prompt.js";
-import { handleValidateMcp } from "./powerMerchant.js";
-import { streamSettingsEvent, streamToolCallEvent } from "./pipeline.js";
 
 export default {
   async fetch(request, env, ctx) {
@@ -142,13 +140,6 @@ export default {
         );
       }
 
-      // -------------------------------------------------------------
-      // ROUTE: Live On-The-Spot MCP Server Validation & Tool Discovery
-      // POST /admin/validate-mcp (delegated to powerMerchant.js)
-      // -------------------------------------------------------------
-      if (url.pathname === "/admin/validate-mcp") {
-        return await handleValidateMcp(request, env, headers);
-      }
 
       // -------------------------------------------------------------
       // ROUTE: Merchant Settings (Save & Load via KV)
@@ -165,20 +156,6 @@ export default {
           // Strict KV read of basic settings
           const config = await env.MERCHANT_SETTINGS.get(shop, { type: "json" });
 
-          // R2 Isolated Merchant Folder: Read MCP servers from merchants/${shop}/mcp_servers.json
-          let mcpServers = [];
-          if (env.CONVERSATIONS_BUCKET) {
-            try {
-              const r2Obj = await env.CONVERSATIONS_BUCKET.get(`merchants/${shop}/mcp_servers.json`);
-              if (r2Obj) {
-                mcpServers = await r2Obj.json();
-              }
-            } catch (_) {}
-          }
-          if (!mcpServers.length && config?.mcp_servers) {
-            mcpServers = config.mcp_servers;
-          }
-
           const defaultOpenAiModel = env.DEFAULT_OPENAI_MODEL || "gpt-5.5";
           const defaultGeminiModel = env.DEFAULT_GEMINI_MODEL || "gemini-3.8-flash";
 
@@ -190,16 +167,12 @@ export default {
               custom_openai_model: "",
               gemini_model: defaultGeminiModel,
               custom_gemini_model: "",
-              power_model: "",
-              custom_power_model: "",
-              has_power_key: false,
               has_openai_key: false,
               has_gemini_key: false,
               notification_email: "",
               persona_tone: "friendly",
               greeting_message: "",
-              system_prompt: "",
-              mcp_servers: mcpServers
+              system_prompt: ""
             }), { headers });
           }
 
@@ -211,16 +184,12 @@ export default {
             custom_openai_model: config.custom_openai_model || "",
             gemini_model: config.gemini_model || defaultGeminiModel,
             custom_gemini_model: config.custom_gemini_model || "",
-            power_model: config.power_model || "",
-            custom_power_model: config.custom_power_model || "",
-            has_power_key: Boolean(config.power_api_key),
             has_openai_key: Boolean(config.openai_api_key),
             has_gemini_key: Boolean(config.gemini_api_key),
             notification_email: config.notification_email || "",
             persona_tone: config.persona_tone || "friendly",
             greeting_message: config.greeting_message || "",
-            system_prompt: config.system_prompt || "",
-            mcp_servers: mcpServers
+            system_prompt: config.system_prompt || ""
           }), { headers });
         }
 
@@ -246,31 +215,6 @@ export default {
             ? (payload.gemini_api_key?.trim() || null)
             : (existing?.gemini_api_key || null);
 
-          const powerKey = payload.power_api_key !== undefined
-            ? (payload.power_api_key?.trim() || null)
-            : (existing?.power_api_key || null);
-
-          let mcpServers = [];
-          if (payload.mcp_servers !== undefined) {
-            try {
-              mcpServers = typeof payload.mcp_servers === "string" ? JSON.parse(payload.mcp_servers) : payload.mcp_servers;
-            } catch (_) {}
-          } else if (existing?.mcp_servers) {
-            mcpServers = existing.mcp_servers;
-          }
-
-          // 1. Save isolated MCP configuration directly to R2 under merchant folder
-          if (env.CONVERSATIONS_BUCKET && mcpServers) {
-            await env.CONVERSATIONS_BUCKET.put(
-              `merchants/${shop}/mcp_servers.json`,
-              JSON.stringify(mcpServers, null, 2),
-              {
-                httpMetadata: { contentType: "application/json" },
-                customMetadata: { shop, updated_at: new Date().toISOString() }
-              }
-            );
-          }
-
           const record = {
             shop,
             provider_mode: payload.provider_mode || "facetimefy",
@@ -279,37 +223,55 @@ export default {
             custom_openai_model: payload.custom_openai_model || existing?.custom_openai_model || "",
             gemini_model: payload.gemini_model || existing?.gemini_model || defaultGeminiModel,
             custom_gemini_model: payload.custom_gemini_model || existing?.custom_gemini_model || "",
-            power_model: payload.power_model || existing?.power_model || "",
-            custom_power_model: payload.custom_power_model || existing?.custom_power_model || "",
-            power_api_key: powerKey,
             openai_api_key: openaiKey,
             gemini_api_key: geminiKey,
             notification_email: payload.notification_email || existing?.notification_email || "",
             persona_tone: payload.persona_tone || existing?.persona_tone || "friendly",
             greeting_message: payload.greeting_message || existing?.greeting_message || "",
             system_prompt: payload.system_prompt || existing?.system_prompt || "",
-            mcp_servers: mcpServers,
             updated_at: new Date().toISOString()
           };
 
           // Strict KV write
           await env.MERCHANT_SETTINGS.put(shop, JSON.stringify(record));
 
-          // Cloudflare Pipelines: Stream configuration event into R2
-          streamSettingsEvent(env, ctx, {
-            shop,
-            powerModel: payload.power_model || "",
-            provider: payload.power_model?.startsWith("gemini-") ? "gemini" : "openai",
-            mcpServers
-          });
-
-          // Queue Producer: Offload asynchronous D1 sync
-          if (env.FTC_QUEUE) {
-            await env.FTC_QUEUE.send({
-              type: "MERCHANT_SETTINGS_SYNC",
-              shop,
-              data: record
-            });
+          // Direct D1 sync
+          if (env.DB) {
+            try {
+              await env.DB.prepare(`
+                INSERT INTO merchants (
+                  shop,
+                  notification_email,
+                  provider,
+                  model,
+                  api_key,
+                  gemini_api_key,
+                  gemini_model,
+                  primary_choice,
+                  updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
+                ON CONFLICT(shop) DO UPDATE SET
+                  notification_email = CASE WHEN excluded.notification_email != '' THEN excluded.notification_email ELSE merchants.notification_email END,
+                  provider = excluded.provider,
+                  model = excluded.model,
+                  api_key = excluded.api_key,
+                  gemini_api_key = excluded.gemini_api_key,
+                  gemini_model = excluded.gemini_model,
+                  primary_choice = excluded.primary_choice,
+                  updated_at = CURRENT_TIMESTAMP
+              `).bind(
+                shop,
+                record.notification_email || "",
+                record.provider_mode || "facetimefy",
+                record.openai_model || "gpt-5.5",
+                record.openai_api_key || null,
+                record.gemini_api_key || null,
+                record.gemini_model || "gemini-3.8-flash",
+                record.primary_choice || "openai_primary"
+              ).run();
+            } catch (dbErr) {
+              console.error("[Settings D1 Sync Error]", dbErr);
+            }
           }
 
           return new Response(JSON.stringify({ success: true, saved: true }), { headers });
@@ -349,26 +311,7 @@ export default {
           let apiKey = env.OPENAI_API_KEY;
           let modelName = env.DEFAULT_OPENAI_MODEL || "gpt-5.5";
 
-          // Power Merchant: Directly serve from database/KV if configured
-          if (config?.power_model) {
-            const raw = config.power_model === "custom" && config.custom_power_model 
-              ? config.custom_power_model 
-              : config.power_model;
-            const isGemini = raw.startsWith("gemini-");
-            provider = isGemini ? "gemini" : "openai";
-            apiKey = config.power_api_key;
-            modelName = raw;
-            if (!apiKey) {
-              await recordAndAlertError(env, {
-                shop,
-                provider,
-                rawError: `Power Merchant API Key for ${provider} (${modelName}) is missing or unconfigured.`,
-                context: "Storefront Chat Execution",
-                merchantEmail: config?.notification_email
-              });
-              return new Response(JSON.stringify({ error: true }), { headers });
-            }
-          } else if (providerMode === "openai") {
+          if (providerMode === "openai") {
             provider = "openai";
             apiKey = config.openai_api_key;
             modelName = (config.openai_model === "custom" && config.custom_openai_model ? config.custom_openai_model : config.openai_model) || "gpt-6-sol";
@@ -411,48 +354,80 @@ export default {
             history = (await env.CHAT_HISTORY.get(convId, { type: "json" })) || [];
           }
 
-          // R2 Isolated Merchant Folder: Load MCP servers and tools
-          let mcpServers = [];
-          if (env.CONVERSATIONS_BUCKET) {
-            try {
-              const r2Obj = await env.CONVERSATIONS_BUCKET.get(`merchants/${shop}/mcp_servers.json`);
-              if (r2Obj) {
-                mcpServers = await r2Obj.json();
-              }
-            } catch (_) {}
-          }
-          if (!mcpServers.length && config?.mcp_servers) {
-            mcpServers = config.mcp_servers;
-          }
+          const masterMcpUrl = (env.MASTER_MCP_URL || MASTER_MCP_URL || "").trim();
+          const ucpProfileUrl = config?.agent_profile_url || env.UCP_PROFILE_URL || "";
 
-          // Map active MCP tools
-          const activeMcpTools = [];
-          const mcpToolMap = new Map();
-          for (const s of mcpServers) {
-            if (s.status === "ready" && Array.isArray(s.tools)) {
-              for (const t of s.tools) {
-                if (t.name) {
-                  activeMcpTools.push({
-                    type: "function",
-                    function: {
-                      name: t.name,
-                      description: t.description || "",
-                      parameters: t.inputSchema || { type: "object", properties: {} }
-                    }
-                  });
-                  mcpToolMap.set(t.name, { url: s.url, headers: s.headers || {} });
+          const activeMcpTools = [
+            {
+              type: "function",
+              function: {
+                name: "search_catalog",
+                description: "Search products in the store catalog",
+                parameters: {
+                  type: "object",
+                  properties: {
+                    query: { type: "string", description: "Search query" },
+                    store_domain: { type: "string", description: "Store domain" }
+                  },
+                  required: ["query"]
+                }
+              }
+            },
+            {
+              type: "function",
+              function: {
+                name: "get_product",
+                description: "Get full product details including variants and availability",
+                parameters: {
+                  type: "object",
+                  properties: {
+                    id: { type: "string", description: "Product ID" },
+                    store_domain: { type: "string", description: "Store domain" }
+                  },
+                  required: ["id"]
+                }
+              }
+            },
+            {
+              type: "function",
+              function: {
+                name: "lookup_catalog",
+                description: "Lookup products or variants by identifiers",
+                parameters: {
+                  type: "object",
+                  properties: {
+                    ids: { type: "array", items: { type: "string" }, description: "Array of product or variant IDs" },
+                    store_domain: { type: "string", description: "Store domain" }
+                  },
+                  required: ["ids"]
+                }
+              }
+            },
+            {
+              type: "function",
+              function: {
+                name: "search_shop_policies_and_faqs",
+                description: "Search store policies, FAQs, shipping, returns, and terms",
+                parameters: {
+                  type: "object",
+                  properties: {
+                    query: { type: "string", description: "Natural language query about policies or FAQs" },
+                    store_domain: { type: "string", description: "Store domain" }
+                  },
+                  required: ["query"]
                 }
               }
             }
-          }
+          ];
 
           const systemPrompt = buildSystemPrompt({
             storeDomain: shop,
-            agentProfileUrl: config?.agent_profile_url || "",
+            agentProfileUrl: ucpProfileUrl,
             customPrompt: config?.system_prompt || ""
           });
 
           let reply = "";
+          let capturedToolResult = null;
 
           if (provider === "openai") {
             const requestBody = {
@@ -464,7 +439,7 @@ export default {
               ]
             };
 
-            if (activeMcpTools.length > 0) {
+            if (masterMcpUrl) {
               requestBody.tools = activeMcpTools;
             }
 
@@ -493,7 +468,7 @@ export default {
             const choice = aiData.choices?.[0]?.message;
 
             // Handle MCP tool invocation
-            if (choice?.tool_calls && choice.tool_calls.length > 0) {
+            if (choice?.tool_calls && choice.tool_calls.length > 0 && masterMcpUrl) {
               const toolMessages = [
                 { role: "system", content: systemPrompt },
                 ...history,
@@ -502,39 +477,14 @@ export default {
               ];
 
               for (const tc of choice.tool_calls) {
-                const target = mcpToolMap.get(tc.function?.name);
-                let toolOutput = "";
-                if (target) {
-                  try {
-                    const mcpRes = await fetch(target.url, {
-                      method: "POST",
-                      headers: {
-                        "Content-Type": "application/json",
-                        ...target.headers
-                      },
-                      body: JSON.stringify({
-                        jsonrpc: "2.0",
-                        id: 1,
-                        method: "tools/call",
-                        params: {
-                          name: tc.function.name,
-                          arguments: JSON.parse(tc.function.arguments || "{}")
-                        }
-                      })
-                    });
-                    const mcpData = await mcpRes.json();
-                    toolOutput = JSON.stringify(mcpData?.result || mcpData?.error || mcpData);
-                  } catch (tErr) {
-                    toolOutput = JSON.stringify({ error: String(tErr) });
-                  }
-                } else {
-                  toolOutput = JSON.stringify({ error: "Tool not found" });
-                }
+                const callArgs = JSON.parse(tc.function?.arguments || "{}");
+                const { output, captured } = await executeMcpTool(masterMcpUrl, tc.function.name, callArgs, shop);
+                if (captured) capturedToolResult = captured;
 
                 toolMessages.push({
                   role: "tool",
                   tool_call_id: tc.id,
-                  content: toolOutput
+                  content: output
                 });
               }
 
@@ -557,35 +507,84 @@ export default {
                 reply = choice.content || "";
               }
 
-              // Cloudflare Pipelines: Stream tool execution event into R2
-              streamToolCallEvent(env, ctx, {
-                shop,
-                modelName,
-                provider,
-                serversCount: mcpServers.length,
-                toolsCount: activeMcpTools.length,
-                conversationId: convId,
-                toolCalls: choice.tool_calls
-              });
             } else {
               reply = choice?.content || "";
             }
           } else if (provider === "gemini") {
+            const geminiContents = [
+              ...history.map(h => ({
+                role: h.role === "assistant" ? "model" : "user",
+                parts: [{ text: h.content }]
+              })),
+              { role: "user", parts: [{ text: userMessage }] }
+            ];
+
+            const geminiRequestBody = {
+              systemInstruction: { parts: [{ text: systemPrompt }] },
+              contents: geminiContents
+            };
+
+            if (masterMcpUrl) {
+              geminiRequestBody.tools = [{
+                functionDeclarations: [
+                  {
+                    name: "search_catalog",
+                    description: "Search products in the store catalog",
+                    parameters: {
+                      type: "OBJECT",
+                      properties: {
+                        query: { type: "STRING", description: "Search query" },
+                        store_domain: { type: "STRING", description: "Store domain" }
+                      },
+                      required: ["query"]
+                    }
+                  },
+                  {
+                    name: "get_product",
+                    description: "Get full product details including variants and availability",
+                    parameters: {
+                      type: "OBJECT",
+                      properties: {
+                        id: { type: "STRING", description: "Product ID" },
+                        store_domain: { type: "STRING", description: "Store domain" }
+                      },
+                      required: ["id"]
+                    }
+                  },
+                  {
+                    name: "lookup_catalog",
+                    description: "Lookup products or variants by identifiers",
+                    parameters: {
+                      type: "OBJECT",
+                      properties: {
+                        ids: { type: "ARRAY", items: { type: "STRING" }, description: "Array of product or variant IDs" },
+                        store_domain: { type: "STRING", description: "Store domain" }
+                      },
+                      required: ["ids"]
+                    }
+                  },
+                  {
+                    name: "search_shop_policies_and_faqs",
+                    description: "Search store policies, FAQs, shipping, returns, and terms",
+                    parameters: {
+                      type: "OBJECT",
+                      properties: {
+                        query: { type: "STRING", description: "Natural language query about policies or FAQs" },
+                        store_domain: { type: "STRING", description: "Store domain" }
+                      },
+                      required: ["query"]
+                    }
+                  }
+                ]
+              }];
+            }
+
             const aiRes = await fetch(
               `https://generativelanguage.googleapis.com/v1beta/models/${modelName}:generateContent?key=${apiKey}`,
               {
                 method: "POST",
                 headers: { "Content-Type": "application/json" },
-                body: JSON.stringify({
-                  systemInstruction: { parts: [{ text: systemPrompt }] },
-                  contents: [
-                    ...history.map(h => ({
-                      role: h.role === "assistant" ? "model" : "user",
-                      parts: [{ text: h.content }]
-                    })),
-                    { role: "user", parts: [{ text: userMessage }] }
-                  ]
-                })
+                body: JSON.stringify(geminiRequestBody)
               }
             );
 
@@ -602,7 +601,56 @@ export default {
             }
 
             const aiData = await aiRes.json();
-            reply = aiData.candidates?.[0]?.content?.parts?.[0]?.text || "";
+            const candidate = aiData.candidates?.[0]?.content;
+            const functionCalls = candidate?.parts?.filter(p => p.functionCall) || [];
+
+            if (functionCalls.length > 0 && masterMcpUrl) {
+              const toolResponses = [];
+              for (const p of functionCalls) {
+                const fc = p.functionCall;
+                const callArgs = fc.args || {};
+                const { output, captured } = await executeMcpTool(masterMcpUrl, fc.name, callArgs, shop);
+                if (captured) capturedToolResult = captured;
+
+                let parsedOutput = {};
+                try { parsedOutput = JSON.parse(output); } catch (_) { parsedOutput = { response: output }; }
+
+                toolResponses.push({
+                  functionResponse: {
+                    name: fc.name,
+                    response: parsedOutput
+                  }
+                });
+              }
+
+              const followUpRes = await fetch(
+                `https://generativelanguage.googleapis.com/v1beta/models/${modelName}:generateContent?key=${apiKey}`,
+                {
+                  method: "POST",
+                  headers: { "Content-Type": "application/json" },
+                  body: JSON.stringify({
+                    systemInstruction: { parts: [{ text: systemPrompt }] },
+                    contents: [
+                      ...geminiContents,
+                      candidate,
+                      {
+                        role: "user",
+                        parts: toolResponses
+                      }
+                    ]
+                  })
+                }
+              );
+
+              if (followUpRes.ok) {
+                const followUpData = await followUpRes.json();
+                reply = followUpData.candidates?.[0]?.content?.parts?.[0]?.text || "";
+              } else {
+                reply = candidate?.parts?.[0]?.text || "";
+              }
+            } else {
+              reply = candidate?.parts?.[0]?.text || "";
+            }
           }
 
           history.push({ role: "user", content: userMessage });
@@ -645,7 +693,11 @@ export default {
           return new Response(JSON.stringify({
             conversation_id: convId,
             message: reply,
-            role: "assistant"
+            role: "assistant",
+            ...(capturedToolResult ? {
+              data: capturedToolResult,
+              products: capturedToolResult.products || capturedToolResult.items || (Array.isArray(capturedToolResult) ? capturedToolResult : undefined)
+            } : {})
           }), { headers });
         }
       }
@@ -690,90 +742,6 @@ export default {
         status: 500,
         headers
       });
-    }
-  },
-
-  /**
-   * Cloudflare Queue Consumer Handler
-   * Consumes messages from the "facetimefy" queue with auto-retry and DLQ fallback
-   */
-  async queue(batch, env) {
-    for (const message of batch.messages) {
-      try {
-        const body = message.body;
-
-        // Subscribed Event: MERCHANT_SETTINGS_SYNC
-        if (body?.type === "MERCHANT_SETTINGS_SYNC" && env.DB) {
-          const { shop, data } = body;
-          await env.DB.prepare(`
-            INSERT INTO merchants (
-              shop,
-              notification_email,
-              provider,
-              model,
-              api_key,
-              gemini_api_key,
-              gemini_model,
-              primary_choice,
-              updated_at
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
-            ON CONFLICT(shop) DO UPDATE SET
-              notification_email = CASE WHEN excluded.notification_email != '' THEN excluded.notification_email ELSE merchants.notification_email END,
-              provider = excluded.provider,
-              model = excluded.model,
-              api_key = excluded.api_key,
-              gemini_api_key = excluded.gemini_api_key,
-              gemini_model = excluded.gemini_model,
-              primary_choice = excluded.primary_choice,
-              updated_at = CURRENT_TIMESTAMP
-          `).bind(
-            shop,
-            data.notification_email || "",
-            data.provider_mode || "facetimefy",
-            data.openai_model || "gpt-5.5",
-            data.openai_api_key || null,
-            data.gemini_api_key || null,
-            data.gemini_model || "gemini-3.8-flash",
-            data.primary_choice || "openai_primary"
-          ).run();
-        }
-
-        // Subscribed Event: ERROR_ALERT
-        if (body?.type === "ERROR_ALERT") {
-          if (env.DB) {
-            await env.DB.prepare(`
-              INSERT INTO error_logs (shop, conversation_id, user_message, error, created_at)
-              VALUES (?, ?, ?, ?, CURRENT_TIMESTAMP)
-            `).bind(
-              body.shop || "system",
-              body.conversationId || null,
-              body.context || "Error Alert",
-              body.rawError || "Unknown error"
-            ).run().catch((dbErr) => console.error("[Queue D1 Log Error]", dbErr));
-          }
-
-          if (body.sendEmail !== false && env.EMAIL) {
-            await dispatchAlertEmail(env, {
-              shop: body.shop,
-              provider: body.provider,
-              rawError: body.rawError,
-              context: body.context,
-              conversationId: body.conversationId,
-              merchantEmail: body.merchantEmail
-            }).catch((emailErr) => console.error("[Queue Alert Email Error]", emailErr));
-          }
-        }
-
-        message.ack();
-      } catch (err) {
-        const body = message.body;
-        await recordSystemError(env, {
-          subsystem: "queue_consumer",
-          rawError: err?.message || String(err),
-          details: { messageId: message.id, type: body?.type }
-        });
-        message.retry();
-      }
     }
   },
 

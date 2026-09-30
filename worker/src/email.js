@@ -167,7 +167,7 @@ export async function recordAndAlertError(env, {
 
 /**
  * Internal System Error Logger (Platform / Developer Only)
- * Writes internal platform failures (Pipelines, storage, unhandled worker exceptions)
+ * Writes internal platform failures (storage, unhandled worker exceptions)
  * directly into the dedicated `system_error_logs` D1 table.
  * STRICT RULE: NEVER alerts the merchant or customer.
  */

@@ -55,28 +55,6 @@
       "name": "EMAIL",
       "remote": true
     }
-  ],
-  "queues": {
-    "producers": [
-      {
-        "binding": "FTC_QUEUE",
-        "queue": "facetimefy"
-      }
-    ],
-    "consumers": [
-      {
-        "queue": "facetimefy",
-        "max_batch_size": 10,
-        "max_batch_timeout": 5,
-        "max_retries": 3,
-        "dead_letter_queue": "ftc-queue-dlq"
-      }
-    ]
-  },
-  "pipelines": [
-    {
-      "binding": "POWER_MERCHANT_STREAM",
-      "stream": "power_merchant"
-    }
   ]
 }
+

@@ -45,8 +45,7 @@ export async function loader({ request }) {
     agentName: "Facetimefy AI",
     welcomeMessage: "👋 Hi there! How can I help you today?",
     inputPlaceholder: "Message Facetimefy AI...",
-    workerUrl: WORKER_URL,
-    mcp_servers: []
+    workerUrl: WORKER_URL
   };
 
   let billingData = null;
@@ -62,8 +61,7 @@ export async function loader({ request }) {
         ...currentSettings,
         ...data,
         notificationEmail: data.notificationEmail || defaultEmail,
-        workerUrl: data.workerUrl || WORKER_URL,
-        mcp_servers: data.mcp_servers || []
+        workerUrl: data.workerUrl || WORKER_URL
       };
     }
     if (billingRes && billingRes.ok) {
@@ -81,11 +79,6 @@ export async function action({ request }) {
   const shop = session.shop;
 
   const formData = await request.formData();
-  let mcpServersList = [];
-  try {
-    const rawMcp = formData.get("mcp_servers");
-    if (rawMcp) mcpServersList = JSON.parse(rawMcp);
-  } catch (_) {}
 
   const payload = {
     shop,
@@ -104,8 +97,7 @@ export async function action({ request }) {
     agentName: formData.get("agentName") || "Facetimefy AI",
     welcomeMessage: formData.get("welcomeMessage") || "👋 Hi there! How can I help you today?",
     inputPlaceholder: formData.get("inputPlaceholder") || "Message Facetimefy AI...",
-    workerUrl: formData.get("workerUrl") || WORKER_URL,
-    mcp_servers: mcpServersList
+    workerUrl: formData.get("workerUrl") || WORKER_URL
   };
 
   try {
@@ -157,90 +149,6 @@ export default function Settings() {
   const [notificationEmail, setNotificationEmail] = useState(currentSettings.notificationEmail || "");
   const [workerUrl, setWorkerUrl] = useState(currentSettings.workerUrl || WORKER_URL);
 
-  // Power Merchant MCP Tool Servers State (supports 100+ servers dynamically)
-  const [mcpServers, setMcpServers] = useState(currentSettings.mcp_servers || []);
-  const [mcpUrl, setMcpUrl] = useState("");
-  const [mcpLabel, setMcpLabel] = useState("");
-  const [showHeaders, setShowHeaders] = useState(false);
-  const [headerName, setHeaderName] = useState("");
-  const [headerValue, setHeaderValue] = useState("");
-  const [customHeadersList, setCustomHeadersList] = useState([]);
-  const [isValidatingMcp, setIsValidatingMcp] = useState(false);
-  const [mcpError, setMcpError] = useState("");
-  const [mcpSuccess, setMcpSuccess] = useState("");
-  const [expandedMcpId, setExpandedMcpId] = useState(null);
-
-  const handleAddHeader = () => {
-    if (!headerName.trim()) return;
-    setCustomHeadersList([
-      ...customHeadersList,
-      { name: headerName.trim(), value: headerValue.trim() }
-    ]);
-    setHeaderName("");
-    setHeaderValue("");
-  };
-
-  const handleRemoveHeader = (index) => {
-    setCustomHeadersList(customHeadersList.filter((_, i) => i !== index));
-  };
-
-  const handleConnectMcp = async () => {
-    if (!mcpUrl || !mcpUrl.trim()) {
-      setMcpError("Please enter a valid MCP server URL (e.g. https://example-mcp-server.com/mcp)");
-      return;
-    }
-    const trimmedUrl = mcpUrl.trim();
-    setIsValidatingMcp(true);
-    setMcpError("");
-    setMcpSuccess("");
-
-    const headersMap = {};
-    for (const h of customHeadersList) {
-      if (h.name && h.value) headersMap[h.name] = h.value;
-    }
-
-    try {
-      const res = await fetch(`${workerUrl}/admin/validate-mcp`, {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ url: trimmedUrl, headers: headersMap, shop })
-      });
-      const data = await res.json();
-      if (data.valid) {
-        const discoveredTools = data.tools || [];
-        const newServer = {
-          id: "mcp_" + Date.now() + "_" + Math.random().toString(36).substring(2, 6),
-          url: trimmedUrl,
-          label: mcpLabel.trim() || trimmedUrl.replace(/^https?:\/\//, "").split("/")[0],
-          status: "ready",
-          tools: discoveredTools,
-          headers: headersMap,
-          connectedAt: new Date().toLocaleTimeString()
-        };
-        setMcpServers([...mcpServers, newServer]);
-        setMcpSuccess(`Connected successfully! Discovered ${discoveredTools.length} tools.`);
-        setMcpUrl("");
-        setMcpLabel("");
-        setCustomHeadersList([]);
-        setShowHeaders(false);
-        setExpandedMcpId(newServer.id);
-      } else {
-        setMcpError(data.error || "Could not connect to server. Check the URL and try again.");
-      }
-    } catch (err) {
-      setMcpError("Could not connect to server. Check the URL and try again.");
-    }
-    setIsValidatingMcp(false);
-  };
-
-  const handleDeleteMcp = (id) => {
-    setMcpServers(mcpServers.filter(s => s.id !== id));
-    if (expandedMcpId === id) setExpandedMcpId(null);
-  };
-
-  const toggleMcpTools = (id) => {
-    setExpandedMcpId(expandedMcpId === id ? null : id);
-  };
 
   const handleProviderChange = (e) => {
     const val = e.target?.value || e.detail?.value || e.currentTarget?.value;
@@ -639,214 +547,6 @@ export default function Settings() {
           </s-stack>
         </s-section>
 
-        {/* ========================================================= */}
-        {/* SECTION 5: FOR POWER MERCHANTS (MCP TOOL SERVERS)         */}
-        {/* ========================================================= */}
-        <input type="hidden" name="mcp_servers" value={JSON.stringify(mcpServers)} />
-        <s-section heading="For Power Merchants">
-          <s-stack direction="block" gap="base">
-            <s-box padding="base" border="base" borderRadius="base">
-              <s-stack direction="block" gap="base">
-                <s-heading>Connect MCP Server</s-heading>
-
-                <s-url-field
-                  label="Server URL"
-                  placeholder="https://example-mcp-server.com/mcp"
-                  value={mcpUrl}
-                  onInput={(e) => setMcpUrl(e.target?.value || e.detail?.value || e.currentTarget?.value || "")}
-                  onChange={(e) => setMcpUrl(e.target?.value || e.detail?.value || e.currentTarget?.value || "")}
-                  onBlur={() => {
-                    if (mcpUrl && mcpUrl.trim().startsWith("http") && !isValidatingMcp) {
-                      handleConnectMcp();
-                    }
-                  }}
-                  details="Only use MCP servers you trust and verify."
-                ></s-url-field>
-
-                <s-text-field
-                  label="Server Label (Optional)"
-                  placeholder="e.g. custom_store_tools"
-                  value={mcpLabel}
-                  onInput={(e) => setMcpLabel(e.target?.value || e.detail?.value || e.currentTarget?.value || "")}
-                  onChange={(e) => setMcpLabel(e.target?.value || e.detail?.value || e.currentTarget?.value || "")}
-                  details="Friendly identifier for routing and telemetry."
-                ></s-text-field>
-
-                <s-stack direction="inline" gap="tight">
-                  <s-button
-                    variant="secondary"
-                    type="button"
-                    onClick={() => {
-                      const next = !showHeaders;
-                      setShowHeaders(next);
-                      if (next && customHeadersList.length === 0) {
-                        setCustomHeadersList([{ name: "", value: "" }]);
-                      }
-                    }}
-                  >
-                    {showHeaders ? "Hide custom headers" : "Add custom headers"}
-                  </s-button>
-                </s-stack>
-
-                {showHeaders && (
-                  <s-box padding="base" background="subdued" border="base" borderRadius="base">
-                    <s-stack direction="block" gap="base">
-                      <s-heading>Custom Headers</s-heading>
-                      {customHeadersList.map((header, idx) => (
-                        <s-grid key={idx} gridTemplateColumns="1fr 1fr auto" gap="base" alignItems="end">
-                          <s-text-field
-                            label="Header name"
-                            placeholder="Authorization"
-                            value={header.name}
-                            onInput={(e) => {
-                              const updated = [...customHeadersList];
-                              updated[idx].name = e.target?.value || e.detail?.value || e.currentTarget?.value || "";
-                              setCustomHeadersList(updated);
-                            }}
-                          ></s-text-field>
-                          <s-text-field
-                            label="Value"
-                            placeholder="Bearer token or API key"
-                            value={header.value}
-                            onInput={(e) => {
-                              const updated = [...customHeadersList];
-                              updated[idx].value = e.target?.value || e.detail?.value || e.currentTarget?.value || "";
-                              setCustomHeadersList(updated);
-                            }}
-                          ></s-text-field>
-                          <s-button
-                            variant="tertiary"
-                            tone="critical"
-                            type="button"
-                            onClick={() => handleRemoveHeader(idx)}
-                          >
-                            Delete
-                          </s-button>
-                        </s-grid>
-                      ))}
-                      <s-stack direction="inline" gap="tight">
-                        <s-button
-                          variant="secondary"
-                          type="button"
-                          onClick={() => setCustomHeadersList([...customHeadersList, { name: "", value: "" }])}
-                        >
-                          + Add another header
-                        </s-button>
-                      </s-stack>
-                    </s-stack>
-                  </s-box>
-                )}
-
-                {mcpError && (
-                  <s-banner tone="critical" dismissible onDismiss={() => setMcpError("")}>
-                    <s-paragraph>{mcpError}</s-paragraph>
-                  </s-banner>
-                )}
-
-                {mcpSuccess && (
-                  <s-banner tone="success" dismissible onDismiss={() => setMcpSuccess("")}>
-                    <s-paragraph>{mcpSuccess}</s-paragraph>
-                  </s-banner>
-                )}
-
-                <s-stack direction="inline" gap="tight">
-                  <s-button
-                    variant="primary"
-                    type="button"
-                    onClick={handleConnectMcp}
-                    loading={isValidatingMcp ? true : undefined}
-                  >
-                    Connect Server
-                  </s-button>
-                </s-stack>
-              </s-stack>
-            </s-box>
-
-            {mcpServers.length > 0 && (
-              <s-stack direction="block" gap="base">
-                <s-stack direction="inline" justifyContent="space-between" alignItems="center">
-                  <s-heading>Connected Servers ({mcpServers.length})</s-heading>
-                  <s-badge tone="info">{mcpServers.reduce((a, s) => a + (s.tools?.length || 0), 0)} tools active</s-badge>
-                </s-stack>
-
-                {mcpServers.map((server) => {
-                  const isReady = server.status === "ready";
-                  const isExpanded = expandedMcpId === server.id;
-                  const toolCount = server.tools?.length || 0;
-
-                  return (
-                    <s-box key={server.id} padding="base" border="base" borderRadius="base" background="subdued">
-                      <s-stack direction="block" gap="tight">
-                        <s-stack direction="inline" justifyContent="space-between" alignItems="center">
-                          <s-stack direction="inline" gap="tight" alignItems="center">
-                            <s-text type="strong">{server.label}</s-text>
-                            <s-badge tone={isReady ? "success" : "critical"}>
-                              {isReady ? "Ready" : "Failed"}
-                            </s-badge>
-                            {isReady && (
-                              <s-text color="subdued">
-                                ({toolCount} {toolCount === 1 ? "tool" : "tools"})
-                              </s-text>
-                            )}
-                          </s-stack>
-
-                          <s-button
-                            variant="tertiary"
-                            tone="critical"
-                            type="button"
-                            onClick={() => handleDeleteMcp(server.id)}
-                          >
-                            Delete
-                          </s-button>
-                        </s-stack>
-
-                        <s-paragraph color="subdued">{server.url}</s-paragraph>
-
-                        {server.error && (
-                          <s-paragraph tone="critical">{server.error}</s-paragraph>
-                        )}
-
-                        {isReady && toolCount > 0 && (
-                          <s-stack direction="block" gap="tight">
-                            <s-stack direction="inline" gap="tight">
-                              <s-button
-                                variant="secondary"
-                                type="button"
-                                onClick={() => toggleMcpTools(server.id)}
-                              >
-                                {isExpanded ? `Hide tools (${toolCount})` : `View discovered tools (${toolCount})`}
-                              </s-button>
-                            </s-stack>
-
-                            {isExpanded && (
-                              <s-stack direction="block" gap="tight">
-                                {server.tools.map((tool, tIdx) => (
-                                  <s-box key={tIdx} padding="base" border="base" borderRadius="base" background="base">
-                                    <s-stack direction="block" gap="tight">
-                                      <s-stack direction="inline" gap="tight" alignItems="center">
-                                        <s-text type="strong">{tool.name}</s-text>
-                                        <s-badge tone="info">Tool</s-badge>
-                                      </s-stack>
-                                      {tool.description && (
-                                        <s-paragraph color="subdued">
-                                          {tool.description}
-                                        </s-paragraph>
-                                      )}
-                                    </s-stack>
-                                  </s-box>
-                                ))}
-                              </s-stack>
-                            )}
-                          </s-stack>
-                        )}
-                      </s-stack>
-                    </s-box>
-                  );
-                })}
-              </s-stack>
-            )}
-          </s-stack>
-        </s-section>
 
         {/* ========================================================= */}
         {/* SECTION 6: TOOLS & RESET CONFIRMATION                     */}

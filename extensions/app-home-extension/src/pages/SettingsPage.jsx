@@ -2,12 +2,11 @@
 import { useState, useEffect } from "preact/hooks";
 import ApiKeysSettings from "../settings/ApiKeysSettings.jsx";
 import SystemMessageSettings from "../settings/SystemMessageSettings.jsx";
-import PowerMerchantSettings from "../settings/PowerMerchantSettings.jsx";
 import { saveSettings, getSettings } from "../api/settingsApi.js";
 
 /**
  * SettingsPage
- * Main layout coordinating AI credentials, persona instructions, Power Merchant MCP tools, and form persistence.
+ * Main layout coordinating AI credentials, persona instructions, and form persistence.
  */
 export default function SettingsPage() {
   // AI Provider & Model States
@@ -20,18 +19,10 @@ export default function SettingsPage() {
   const [openaiKey, setOpenaiKey] = useState("");
   const [geminiKey, setGeminiKey] = useState("");
 
-  // Power Merchant Model & Key States
-  const [powerModel, setPowerModel] = useState("");
-  const [powerApiKey, setPowerApiKey] = useState("");
-  const [customPowerModel, setCustomPowerModel] = useState("");
-
   // System Message & Persona States
   const [personaTone, setPersonaTone] = useState("friendly");
   const [greetingMessage, setGreetingMessage] = useState("");
   const [systemPrompt, setSystemPrompt] = useState("");
-
-  // Power Merchant MCP Servers State (supports 100+ servers dynamically)
-  const [mcpServers, setMcpServers] = useState([]);
 
   // Saving state
   const [isSaving, setIsSaving] = useState(false);
@@ -48,18 +39,9 @@ export default function SettingsPage() {
           if (data.custom_openai_model) setCustomOpenaiModel(data.custom_openai_model);
           if (data.gemini_model) setGeminiModel(data.gemini_model);
           if (data.custom_gemini_model) setCustomGeminiModel(data.custom_gemini_model);
-          if (data.power_model) setPowerModel(data.power_model);
-          if (data.power_api_key) setPowerApiKey(data.power_api_key);
-          if (data.custom_power_model) setCustomPowerModel(data.custom_power_model);
           if (data.persona_tone) setPersonaTone(data.persona_tone);
           if (data.greeting_message) setGreetingMessage(data.greeting_message);
           if (data.system_prompt) setSystemPrompt(data.system_prompt);
-          if (data.mcp_servers) {
-            try {
-              const parsed = typeof data.mcp_servers === "string" ? JSON.parse(data.mcp_servers) : data.mcp_servers;
-              if (Array.isArray(parsed)) setMcpServers(parsed);
-            } catch (_) {}
-          }
         }
       }).catch(() => {});
     }
@@ -79,15 +61,11 @@ export default function SettingsPage() {
     formEntries.custom_openai_model = customOpenaiModel;
     formEntries.gemini_model = geminiModel;
     formEntries.custom_gemini_model = customGeminiModel;
-    formEntries.power_model = powerModel;
-    formEntries.power_api_key = powerApiKey;
-    formEntries.custom_power_model = customPowerModel;
     formEntries.openai_api_key = openaiKey;
     formEntries.gemini_api_key = geminiKey;
     formEntries.persona_tone = personaTone;
     formEntries.greeting_message = greetingMessage;
     formEntries.system_prompt = systemPrompt;
-    formEntries.mcp_servers = JSON.stringify(mcpServers);
 
     const shop = new URLSearchParams(window.location.search).get("shop");
     if (shop) formEntries.shop = shop;
@@ -147,18 +125,6 @@ export default function SettingsPage() {
           setGreetingMessage={setGreetingMessage}
           systemPrompt={systemPrompt}
           setSystemPrompt={setSystemPrompt}
-        />
-
-        {/* Module 3: For Power Merchants (MCP Tool Servers & Custom AI Engine) */}
-        <PowerMerchantSettings
-          mcpServers={mcpServers}
-          setMcpServers={setMcpServers}
-          powerModel={powerModel}
-          setPowerModel={setPowerModel}
-          powerApiKey={powerApiKey}
-          setPowerApiKey={setPowerApiKey}
-          customPowerModel={customPowerModel}
-          setCustomPowerModel={setCustomPowerModel}
         />
 
         {/* Primary Save Button */}
